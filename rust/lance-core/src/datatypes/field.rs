@@ -43,12 +43,11 @@ use crate::{
 pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
 
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
-    field.data_type() == &DataType::LargeBinary
-        && field
-            .metadata()
-            .get(ARROW_EXT_NAME_KEY)
-            .map(|name| name == BLOB_V2_EXT_NAME)
-            .unwrap_or(false)
+    field
+        .metadata()
+        .get(ARROW_EXT_NAME_KEY)
+        .map(|name| name == BLOB_V2_EXT_NAME)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -514,15 +513,17 @@ impl Field {
     ///
     /// If the field is not a blob, return the field itself.
     pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
-        if self.data_type().is_binary_like() && self.is_blob() {
+        if self.is_blob() {
             match version {
                 BlobVersion::V2 => {
                     self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
                     self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
+                    self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
                 }
                 BlobVersion::V1 => {
                     self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
                     self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+                    self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
                 }
             }
         }
