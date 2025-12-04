@@ -75,9 +75,15 @@ There are two important labels to apply to relevant issues and PRs:
   after merging a PR.
 2. `critical-fix`: Any PR that fixes a critical bug (e.g., security issue, data
   corruption, crash) should be labelled as such. These are bugs that users might
-  have without realizing. Fixes that aren't critical include bugs that return
-  an error message. These labels are used to determine whether a patch release
-  is needed.
+  have without realizing. Examples:
+
+    1. Security fix: a statically linked crypto library had a security vulnerability.
+    2. Incorrect data: a query would return 5 for 2 + 2.
+    3. Corruption: an index would become unreadable after a particular sequence of writes.
+    4. Crash: some condition causes a panic. (These are critical in part because they can be exploited in DDoS attacks.)
+
+> [!NOTE]
+> Not all bug fixes are critical fixes. Examples of non-critical fixes: a function returns an error for valid parameters due to incomplete functionality, or a build configuration causes a compiler error. These kinds of bugs might block a user from adopting a new feature, but aren’t issues that appear in production at runtime.
 
 ## Code of Conduct
 
