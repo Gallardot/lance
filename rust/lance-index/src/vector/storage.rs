@@ -5,7 +5,7 @@
 
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch};
 use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
@@ -23,6 +23,7 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::{
     pb,
     vector::{
+        bq::storage::pack_codes,
         ivf::storage::{IvfModel, IVF_METADATA_KEY},
         quantizer::Quantization,
     },
@@ -155,12 +156,177 @@ impl<Q: Quantization> StorageBuilder<Q> {
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
+        // RabitQ has two layouts:
+        // - Row-major (unpacked) codes: required for HNSW (random access)
+        // - Packed codes: faster SIMD scanning for IVF
+        //
+        // Packing is a build-time choice based on the index stage, and must not be repeated when
+        // loading from disk (to avoid double-packing).
+        if Q::quantization_type() == crate::vector::quantizer::QuantizationType::Rabit {
+            let pack_rabit_codes = self
+                .quantization_metadata
+                .as_ref()
+                .map(|m| m.transposed)
+                .unwrap_or(true);
+            if pack_rabit_codes {
+                let codes = batch
+                    .column_by_name(self.quantizer.column())
+                    .expect("quantizer column exists");
+                let codes = codes.as_any().downcast_ref::<FixedSizeListArray>().ok_or(
+                    Error::invalid_input("RabitQ codes must be a FixedSizeListArray", location!()),
+                )?;
+                let packed = pack_codes(codes);
+                batch = batch.replace_column_by_name(self.quantizer.column(), Arc::new(packed))?;
+            }
+        }
+
         Q::Storage::try_from_batch(
             batch,
             &self.quantizer.metadata(self.quantization_metadata.clone()),
             self.distance_type,
             self.frag_reuse_index.clone(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, Float32Array, UInt64Array, UInt8Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::distance::DistanceType;
+
+    use crate::vector::bq::builder::RabitQuantizer;
+    use crate::vector::bq::storage::{pack_codes, RABIT_CODE_COLUMN};
+    use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
+    use crate::vector::quantizer::{QuantizationMetadata, QuantizerStorage};
+
+    #[test]
+    fn test_storage_builder_packs_rabit_by_default() {
+        let num_vectors = 64;
+        let code_len = 8;
+        let codes_data = (0..(num_vectors * code_len))
+            .map(|v| v as u8)
+            .collect::<Vec<_>>();
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(codes_data), code_len as i32)
+                .unwrap();
+        let expected_packed = pack_codes(&codes);
+
+        let add_factors = Float32Array::from(vec![0.0; num_vectors]);
+        let scale_factors = Float32Array::from(vec![0.0; num_vectors]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(ROW_ID, DataType::UInt64, true),
+                Field::new(RABIT_CODE_COLUMN, codes.data_type().clone(), true),
+                Field::new(ADD_FACTORS_COLUMN, DataType::Float32, true),
+                Field::new(SCALE_FACTORS_COLUMN, DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0_u64..(num_vectors as u64))),
+                Arc::new(codes.clone()),
+                Arc::new(add_factors),
+                Arc::new(scale_factors),
+            ],
+        )
+        .unwrap();
+
+        let rq = RabitQuantizer::new::<arrow::datatypes::Float32Type>(1, (code_len * 8) as i32);
+        let storage = StorageBuilder::new("vec".to_owned(), DistanceType::L2, rq, None)
+            .unwrap()
+            .build(vec![batch])
+            .unwrap();
+
+        assert!(storage.metadata().packed);
+
+        let stored_batch = storage.to_batches().unwrap().next().unwrap();
+        let stored_codes = stored_batch
+            .column_by_name(RABIT_CODE_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(
+            stored_codes
+                .values()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .values(),
+            expected_packed
+                .values()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .values()
+        );
+    }
+
+    #[test]
+    fn test_storage_builder_does_not_pack_rabit_when_disabled() {
+        let num_vectors = 64;
+        let code_len = 8;
+        let codes_data = (0..(num_vectors * code_len))
+            .map(|v| v as u8)
+            .collect::<Vec<_>>();
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(codes_data), code_len as i32)
+                .unwrap();
+
+        let add_factors = Float32Array::from(vec![0.0; num_vectors]);
+        let scale_factors = Float32Array::from(vec![0.0; num_vectors]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(ROW_ID, DataType::UInt64, true),
+                Field::new(RABIT_CODE_COLUMN, codes.data_type().clone(), true),
+                Field::new(ADD_FACTORS_COLUMN, DataType::Float32, true),
+                Field::new(SCALE_FACTORS_COLUMN, DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0_u64..(num_vectors as u64))),
+                Arc::new(codes.clone()),
+                Arc::new(add_factors),
+                Arc::new(scale_factors),
+            ],
+        )
+        .unwrap();
+
+        let rq = RabitQuantizer::new::<arrow::datatypes::Float32Type>(1, (code_len * 8) as i32);
+        let storage = StorageBuilder::new("vec".to_owned(), DistanceType::L2, rq, None)
+            .unwrap()
+            .with_metadata(QuantizationMetadata {
+                transposed: false,
+                ..Default::default()
+            })
+            .build(vec![batch])
+            .unwrap();
+
+        assert!(!storage.metadata().packed);
+
+        let stored_batch = storage.to_batches().unwrap().next().unwrap();
+        let stored_codes = stored_batch
+            .column_by_name(RABIT_CODE_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(
+            stored_codes
+                .values()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .values(),
+            codes
+                .values()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .values()
+        );
     }
 }
 

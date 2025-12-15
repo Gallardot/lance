@@ -68,8 +68,7 @@ impl RabitQuantizer {
             rotate_mat: Some(rotate_mat),
             rotate_mat_position: 0,
             num_bits,
-            use_packed_codes: true,
-            codes_are_packed: false,
+            packed: true,
         };
         Self { metadata }
     }
@@ -259,8 +258,7 @@ impl Quantization for RabitQuantizer {
     ) -> Self::Metadata {
         let mut metadata = self.metadata.clone();
         if let Some(args) = args {
-            metadata.use_packed_codes = args.transposed;
-            metadata.codes_are_packed = args.transposed;
+            metadata.packed = args.transposed;
         }
         metadata
     }
