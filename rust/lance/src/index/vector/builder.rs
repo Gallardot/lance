@@ -833,8 +833,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         column: String,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<(Q::Storage, S)> {
-        let storage = StorageBuilder::new(column, distance_type, quantizer, frag_reuse_index)?
-            .build(batches)?;
+        let mut storage_builder =
+            StorageBuilder::new(column, distance_type, quantizer, frag_reuse_index)?;
+
+        if Q::quantization_type() == QuantizationType::Rabit
+            && matches!(SubIndexType::try_from(S::name()), Ok(SubIndexType::Hnsw))
+        {
+            storage_builder = storage_builder.with_metadata(QuantizationMetadata {
+                transposed: false,
+                ..Default::default()
+            });
+        }
+
+        let storage = storage_builder.build(batches)?;
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
 
         Ok((storage, sub_index))
@@ -888,16 +899,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     }
                 }
                 QuantizationType::Rabit => {
+                    let packed = part_storage
+                        .as_any()
+                        .downcast_ref::<lance_index::vector::bq::storage::RabitQuantizationStorage>(
+                        )
+                        .map(|s| s.metadata().packed)
+                        .unwrap_or(true);
                     for batch in part_batches.iter_mut() {
                         if batch.num_rows() == 0 {
                             continue;
                         }
 
-                        let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list();
-                        let original_codes = unpack_codes(codes);
-                        *batch = batch
-                            .replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(original_codes))?
-                            .drop_column(PART_ID_COLUMN)?;
+                        if packed {
+                            let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list();
+                            let original_codes = unpack_codes(codes);
+                            *batch = batch
+                                .replace_column_by_name(
+                                    RABIT_CODE_COLUMN,
+                                    Arc::new(original_codes),
+                                )?
+                                .drop_column(PART_ID_COLUMN)?;
+                        } else {
+                            *batch = batch.drop_column(PART_ID_COLUMN)?;
+                        }
                     }
                 }
                 _ => {}
@@ -1031,10 +1055,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         // For now, each partition's metadata is just the quantizer,
         // it's all the same for now, so we just take the first one
+        let transposed = !(Q::quantization_type() == QuantizationType::Rabit
+            && matches!(SubIndexType::try_from(S::name()), Ok(SubIndexType::Hnsw)));
+
         let mut metadata = quantizer.metadata(Some(QuantizationMetadata {
             codebook_position: Some(0),
             codebook: None,
-            transposed: true,
+            transposed,
         }));
         if let Some(extra_metadata) = metadata.extra_metadata()? {
             let idx = storage_writer.add_global_buffer(extra_metadata).await?;

@@ -68,6 +68,7 @@ impl RabitQuantizer {
             rotate_mat: Some(rotate_mat),
             rotate_mat_position: 0,
             num_bits,
+            pack: true,
             packed: false,
         };
         Self { metadata }
@@ -257,7 +258,9 @@ impl Quantization for RabitQuantizer {
         args: Option<crate::vector::quantizer::QuantizationMetadata>,
     ) -> Self::Metadata {
         let mut metadata = self.metadata.clone();
-        metadata.packed = args.map(|args| args.transposed).unwrap_or_default();
+        if let Some(args) = args {
+            metadata.pack = args.transposed;
+        }
         metadata
     }
 

@@ -128,6 +128,7 @@ pub enum IndexType {
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
     IvfRq = 107,
+    IvfHnswRq = 108,
 }
 
 impl std::fmt::Display for IndexType {
@@ -149,6 +150,7 @@ impl std::fmt::Display for IndexType {
             Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
             Self::IvfHnswFlat => write!(f, "IVF_HNSW_FLAT"),
             Self::IvfRq => write!(f, "IVF_RQ"),
+            Self::IvfHnswRq => write!(f, "IVF_HNSW_RQ"),
         }
     }
 }
@@ -175,6 +177,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswSq as i32 => Ok(Self::IvfHnswSq),
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
+            v if v == Self::IvfHnswRq as i32 => Ok(Self::IvfHnswRq),
             _ => Err(Error::InvalidInput {
                 source: format!("the input value {} is not a valid IndexType", value).into(),
                 location: location!(),
@@ -204,6 +207,7 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "IVF_HNSW_RQ" => Ok(Self::IvfHnswRq),
             _ => Err(Error::invalid_input(
                 format!("invalid index type: {}", value),
                 location!(),
@@ -238,6 +242,7 @@ impl IndexType {
                 | Self::IvfFlat
                 | Self::IvfSq
                 | Self::IvfRq
+                | Self::IvfHnswRq
         )
     }
 
@@ -272,7 +277,8 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat
-            | Self::IvfRq => 1,
+            | Self::IvfRq
+            | Self::IvfHnswRq => 1,
         }
     }
 
@@ -291,6 +297,7 @@ impl IndexType {
             Self::IvfHnswFlat => 1 << 20,
             Self::IvfHnswSq => 1 << 20,
             Self::IvfHnswPq => 1 << 20,
+            Self::IvfHnswRq => 1 << 20,
             _ => 8192,
         }
     }

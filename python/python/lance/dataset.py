@@ -2656,7 +2656,7 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.
         index_type : str
             The type of the index.
-            ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
+            ``"IVF_PQ, IVF_HNSW_PQ, IVF_HNSW_SQ and IVF_HNSW_RQ"`` are supported now.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2876,6 +2876,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
             "IVF_RQ",
+            "IVF_HNSW_RQ",
         ]
         if index_type not in valid_index_types:
             raise NotImplementedError(

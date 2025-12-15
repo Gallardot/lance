@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-use super::quantizer::{Quantizer, QuantizerMetadata};
+use super::quantizer::{QuantizationMetadata, Quantizer, QuantizerMetadata};
 use super::DISTANCE_TYPE_KEY;
 
 /// <section class="warning">
@@ -111,6 +111,7 @@ pub struct StorageBuilder<Q: Quantization> {
     quantizer: Q,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    quantization_metadata: Option<QuantizationMetadata>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -125,7 +126,13 @@ impl<Q: Quantization> StorageBuilder<Q> {
             distance_type,
             quantizer,
             frag_reuse_index,
+            quantization_metadata: None,
         })
+    }
+
+    pub fn with_metadata(mut self, metadata: QuantizationMetadata) -> Self {
+        self.quantization_metadata = Some(metadata);
+        self
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
@@ -150,7 +157,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
 
         Q::Storage::try_from_batch(
             batch,
-            &self.quantizer.metadata(None),
+            &self.quantizer.metadata(self.quantization_metadata.clone()),
             self.distance_type,
             self.frag_reuse_index.clone(),
         )

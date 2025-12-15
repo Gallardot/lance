@@ -47,7 +47,14 @@ pub struct RabitQuantizationMetadata {
     pub rotate_mat: Option<FixedSizeListArray>,
     pub rotate_mat_position: u32,
     pub num_bits: u8,
+    #[serde(default = "default_true")]
+    pub pack: bool,
+    #[serde(default)]
     pub packed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
@@ -163,6 +170,7 @@ pub struct RabitDistCalculator<'a> {
     num_bits: u8,
     // n * d * num_bits / 8 bytes
     codes: &'a [u8],
+    packed_codes: bool,
     // this is a flattened 2D array of size d/4 * 16,
     // we split the query codes into d/4 chunks, each chunk is with 4 elements,
     // then dist_table[i][j] is the distance between the i-th query code and the code j
@@ -183,6 +191,7 @@ impl<'a> RabitDistCalculator<'a> {
         dist_table: Vec<f32>,
         sum_q: f32,
         codes: &'a [u8],
+        packed_codes: bool,
         add_factors: &'a [f32],
         scale_factors: &'a [f32],
         query_factor: f32,
@@ -191,6 +200,7 @@ impl<'a> RabitDistCalculator<'a> {
             dim,
             num_bits,
             codes,
+            packed_codes,
             dist_table,
             add_factors,
             scale_factors,
@@ -299,7 +309,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         let id = id as usize;
         let code_len = self.dim * (self.num_bits as usize) / u8::BITS as usize;
         let num_vectors = self.codes.len() / code_len;
-        let code = get_rq_code(self.codes, id, num_vectors, code_len);
+        let code = get_rq_code(self.codes, id, num_vectors, code_len, self.packed_codes);
         let dist = code
             .zip(self.dist_table.chunks_exact(SEGMENT_NUM_CODES).tuples())
             .map(|(code_byte, (dist_table, next_dist_table))| {
@@ -325,38 +335,41 @@ impl DistCalculator for RabitDistCalculator<'_> {
         }
 
         let mut dists = vec![0.0; n];
+        if self.packed_codes {
+            let (qmin, qmax, quantized_dists_table) = quantize_dist_table(&self.dist_table);
+            let mut quantized_dists = vec![0; n];
 
-        let (qmin, qmax, quantized_dists_table) = quantize_dist_table(&self.dist_table);
-        let mut quantized_dists = vec![0; n];
-
-        let remainder = n % BATCH_SIZE;
-        simd::dist_table::sum_4bit_dist_table(
-            n - remainder,
-            code_len,
-            self.codes,
-            &quantized_dists_table,
-            &mut quantized_dists,
-        );
-        if remainder > 0 {
-            compute_rq_distance_flat(
-                &self.dist_table,
-                self.codes,
+            let remainder = n % BATCH_SIZE;
+            simd::dist_table::sum_4bit_dist_table(
                 n - remainder,
-                remainder,
-                &mut dists,
+                code_len,
+                self.codes,
+                &quantized_dists_table,
+                &mut quantized_dists,
             );
-        }
+            if remainder > 0 {
+                compute_rq_distance_flat(
+                    &self.dist_table,
+                    self.codes,
+                    n - remainder,
+                    remainder,
+                    &mut dists,
+                );
+            }
 
-        let range = (qmax - qmin) / 255.0;
-        let num_tables = quantized_dists_table.len() / 16;
-        let sum_min = num_tables as f32 * qmin;
-        dists
-            .iter_mut()
-            .take(n - remainder)
-            .zip(quantized_dists.into_iter().take(n - remainder))
-            .for_each(|(dist, q_dist)| {
-                *dist = (q_dist as f32) * range + sum_min;
-            });
+            let range = (qmax - qmin) / 255.0;
+            let num_tables = quantized_dists_table.len() / 16;
+            let sum_min = num_tables as f32 * qmin;
+            dists
+                .iter_mut()
+                .take(n - remainder)
+                .zip(quantized_dists.into_iter().take(n - remainder))
+                .for_each(|(dist, q_dist)| {
+                    *dist = (q_dist as f32) * range + sum_min;
+                });
+        } else {
+            compute_rq_distance_flat(&self.dist_table, self.codes, 0, n, &mut dists);
+        }
 
         dists
             .into_iter()
@@ -438,6 +451,7 @@ impl VectorStore for RabitQuantizationStorage {
             dist_table,
             sum_q,
             codes,
+            self.metadata.packed,
             self.add_factors.values(),
             self.scale_factors.values(),
             q_factor,
@@ -446,8 +460,56 @@ impl VectorStore for RabitQuantizationStorage {
 
     // TODO: implement this
     // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
-    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
-        unimplemented!("RabitQ does not support dist_calculator_from_id")
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+        let id = id as usize;
+        let code_len = self.codes.value_length() as usize;
+        let codes_values = self.codes.values().as_primitive::<UInt8Type>().values();
+        let num_vectors = self.codes.len();
+
+        // decode the query code for the given id
+        let query_code: Vec<u8> = get_rq_code(
+            codes_values,
+            id,
+            num_vectors,
+            code_len,
+            self.metadata.packed,
+        )
+        .collect();
+
+        // reconstruct a signed query vector (+1/-1) from the binary codes
+        let dim = (code_len * (u8::BITS as usize)) / (self.metadata.num_bits as usize);
+        let mut rotated_query = Vec::with_capacity(dim);
+        for (byte_idx, byte) in query_code.iter().enumerate() {
+            for bit in 0..8 {
+                let dim_idx = byte_idx * 8 + bit;
+                if dim_idx >= dim {
+                    break;
+                }
+                let sign = if (byte >> bit) & 1 == 1 { 1.0 } else { -1.0 };
+                rotated_query.push(sign);
+            }
+        }
+
+        let dist_table = build_dist_table_direct::<Float32Type>(&rotated_query);
+        let sum_q: f32 = rotated_query.iter().sum();
+
+        let query_factor = match self.distance_type {
+            DistanceType::L2 => self.add_factors.value(id),
+            DistanceType::Cosine | DistanceType::Dot => self.add_factors.value(id) - 1.0,
+            dt => unimplemented!("RabitQ does not support distance type: {}", dt),
+        };
+
+        RabitDistCalculator::new(
+            rotated_query.len(),
+            self.metadata.num_bits,
+            dist_table,
+            sum_q,
+            codes_values,
+            self.metadata.packed,
+            self.add_factors.values(),
+            self.scale_factors.values(),
+            query_factor,
+        )
     }
 }
 
@@ -619,17 +681,17 @@ impl QuantizerStorage for RabitQuantizationStorage {
             .as_primitive::<Float32Type>()
             .clone();
 
-        let (batch, codes) = if !metadata.packed {
-            let codes = pack_codes(&codes);
-            let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
-            let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
-            (batch, codes)
-        } else {
-            (batch, codes)
-        };
-
         let mut metadata = metadata.clone();
-        metadata.packed = true;
+        let (batch, codes) = match (metadata.pack, metadata.packed) {
+            (true, false) => {
+                let codes = pack_codes(&codes);
+                let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
+                let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+                metadata.packed = true;
+                (batch, codes)
+            }
+            _ => (batch, codes),
+        };
 
         Ok(Self {
             metadata,
@@ -672,13 +734,25 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 Some(Some(new_id)) => {
                     indices.push(i as u32);
                     new_row_ids.push(*new_id);
-                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
+                    new_codes.extend(get_rq_code(
+                        codes,
+                        i,
+                        num_vectors,
+                        num_code_bytes,
+                        self.metadata.packed,
+                    ));
                 }
                 Some(None) => {}
                 None => {
                     indices.push(i as u32);
                     new_row_ids.push(*row_id);
-                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
+                    new_codes.extend(get_rq_code(
+                        codes,
+                        i,
+                        num_vectors,
+                        num_code_bytes,
+                        self.metadata.packed,
+                    ));
                 }
             }
         }
@@ -688,10 +762,17 @@ impl QuantizerStorage for RabitQuantizationStorage {
             UInt8Array::from(new_codes),
             num_code_bytes as i32,
         )?;
+        let mut metadata = self.metadata.clone();
         let batch = if new_row_ids.is_empty() {
             RecordBatch::new_empty(self.schema().clone())
         } else {
-            let codes = Arc::new(pack_codes(&new_codes));
+            let codes: Arc<FixedSizeListArray> = if metadata.pack {
+                metadata.packed = true;
+                Arc::new(pack_codes(&new_codes))
+            } else {
+                metadata.packed = false;
+                Arc::new(new_codes)
+            };
             self.batch
                 .take(&UInt32Array::from(indices))?
                 .replace_column_by_name(ROW_ID, Arc::new(new_row_ids.clone()))?
@@ -700,7 +781,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
 
         Ok(Self {
-            metadata: self.metadata.clone(),
+            metadata,
             distance_type: self.distance_type,
             batch,
             codes,
@@ -717,7 +798,14 @@ fn get_rq_code(
     id: usize,
     num_vectors: usize,
     num_code_bytes: usize,
+    packed: bool,
 ) -> impl Iterator<Item = u8> + '_ {
+    if !packed {
+        let start = id * num_code_bytes;
+        let end = start + num_code_bytes;
+        return codes[start..end].iter().copied().collect_vec().into_iter();
+    }
+
     let remainder = num_vectors % BATCH_SIZE;
 
     if id < num_vectors - remainder {
@@ -760,6 +848,9 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::bq::builder::RabitQuantizer;
+    use crate::vector::quantizer::Quantization;
+    use arrow_array::ArrayRef;
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -823,5 +914,100 @@ mod tests {
                 num_vectors
             );
         }
+    }
+
+    #[test]
+    fn test_dist_calculator_from_id_unpacked() {
+        let dim = 8;
+        let vectors = vec![
+            0.2_f32, -0.1, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, -0.5, 0.4, -0.3, 0.2, -0.1, 0.0, 0.1,
+            0.2,
+        ];
+        let fsl = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vectors.clone()),
+            dim as i32,
+        )
+        .unwrap();
+
+        let rq = RabitQuantizer::new::<Float32Type>(1, dim as i32);
+        let codes = rq.quantize(&fsl).unwrap();
+        let codes_fsl = codes.as_fixed_size_list().clone();
+
+        let res_norms: Vec<f32> = fsl
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks(dim)
+            .map(|chunk| chunk.iter().map(|v| v * v).sum())
+            .collect();
+        let ip_rq_res = rq.codes_res_dot_dists::<Float32Type>(&fsl).unwrap();
+
+        let add_factors = Float32Array::from(res_norms.clone());
+        let scale_factors =
+            Float32Array::from_iter_values(res_norms.iter().zip(ip_rq_res.iter()).map(
+                |(res_norm, ip)| {
+                    if *ip == 0.0 {
+                        0.0
+                    } else {
+                        (-2.0 * res_norm) / ip
+                    }
+                },
+            ));
+
+        let row_ids = UInt64Array::from(vec![0, 1]);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
+            arrow_schema::Field::new(RABIT_CODE_COLUMN, codes_fsl.data_type().clone(), true),
+            arrow_schema::Field::new(ADD_FACTORS_COLUMN, DataType::Float32, true),
+            arrow_schema::Field::new(SCALE_FACTORS_COLUMN, DataType::Float32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(row_ids),
+                Arc::new(codes_fsl.clone()),
+                Arc::new(add_factors),
+                Arc::new(scale_factors),
+            ],
+        )
+        .unwrap();
+
+        let mut metadata = rq.metadata(None);
+        metadata.pack = false;
+        metadata.packed = false;
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+
+        assert!(!storage.metadata().pack);
+        assert!(!storage.metadata().packed);
+
+        let stored_codes = storage
+            .codes
+            .values()
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec();
+        let original_codes = codes_fsl
+            .values()
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec();
+        assert_eq!(stored_codes, original_codes);
+
+        let query0: ArrayRef = Arc::new(Float32Array::from(vectors[..dim].to_vec()));
+        let dist_q_c0 = res_norms[0];
+
+        let dc_query = storage.dist_calculator(query0, dist_q_c0);
+        let dc_from_id = storage.dist_calculator_from_id(0);
+
+        let dist_query = dc_query.distance(1);
+        let dist_id = dc_from_id.distance(1);
+        let diff = (dist_query - dist_id).abs();
+
+        assert!(
+            diff < 0.4,
+            "distance mismatch diff={diff}, query={dist_query}, from_id={dist_id}"
+        );
     }
 }

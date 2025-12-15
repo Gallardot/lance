@@ -269,6 +269,24 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn with_ivf_hnsw_rq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+        rq: RQBuildParams,
+    ) -> Self {
+        let stages = vec![
+            StageParams::Ivf(ivf),
+            StageParams::Hnsw(hnsw),
+            StageParams::RQ(rq),
+        ];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
     pub fn index_type(&self) -> IndexType {
         let len = self.stages.len();
         match (len, self.stages.get(1), self.stages.last()) {
@@ -280,6 +298,7 @@ impl VectorIndexParams {
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::RQ(_))) => IndexType::IvfHnswRq,
             _ => IndexType::Vector,
         }
     }
@@ -545,6 +564,33 @@ pub(crate) async fn build_vector_index(
             .build()
             .await?;
         }
+        IndexType::IvfHnswRq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+            let StageParams::RQ(rq_params) = &stages[2] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(rq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .build()
+            .await?;
+        }
         _ => {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid index type: {:?}", index_type),
@@ -776,10 +822,20 @@ pub(crate) async fn build_vector_index_incremental(
                     .await?;
                 }
                 QuantizationType::Rabit => {
-                    return Err(Error::Index {
-                        message: "Rabit quantization is not supported for HNSW index".to_string(),
-                        location: location!(),
-                    });
+                    IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
+                        dataset.clone(),
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        shuffler,
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                        OptimizeOptions::append(),
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(quantizer.try_into()?)
+                    .build()
+                    .await?;
                 }
             }
         }
@@ -1127,10 +1183,14 @@ pub async fn initialize_vector_index(
                     )
                 }
                 QuantizationType::Rabit => {
-                    return Err(Error::Index {
-                        message: "Rabit quantization is not supported for HNSW index".to_string(),
-                        location: location!(),
-                    });
+                    let rabit_quantizer: RabitQuantizer = quantizer.try_into()?;
+                    let rabit_params = derive_rabit_params(&rabit_quantizer);
+                    VectorIndexParams::with_ivf_hnsw_rq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        rabit_params,
+                    )
                 }
             }
         }
