@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt8Array};
 use arrow_schema::{DataType, Field};
 use bitvec::prelude::{BitVec, Lsb0};
 use deepsize::DeepSizeOf;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use lance_core::{Error, Result};
-use ndarray::{s, Axis};
+use ndarray::s;
 use num_traits::{AsPrimitive, FromPrimitive};
 use rand_distr::Distribution;
 use snafu::location;
@@ -118,27 +118,24 @@ impl RabitQuantizer {
             ));
         }
 
-        // convert the vector to a dxN matrix
-        let vec_mat = ndarray::ArrayView2::from_shape(
-            (residual_vectors.len(), dim),
-            residual_vectors
-                .values()
-                .as_any()
-                .downcast_ref::<T::ArrayType>()
-                .unwrap()
-                .as_slice(),
-        )
-        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let vec_mat = vec_mat.t();
+        let (_, ip_rq_res, _) = self.transform_with_rotated::<T>(residual_vectors, false)?;
+        Ok(ip_rq_res)
+    }
 
-        let rotate_mat = self.rotate_mat::<T>();
-        // slice to (code_dim, dim)
-        let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
-        let rotated_vectors = rotate_mat.dot(&vec_mat);
-        let sqrt_dim = (dim as f32 * self.metadata.num_bits as f32).sqrt();
-        let norm_dists = rotated_vectors.mapv(|v| v.as_().abs()).sum_axis(Axis(0)) / sqrt_dim;
-        debug_assert_eq!(norm_dists.len(), residual_vectors.len());
-        Ok(norm_dists.to_vec())
+    pub(crate) fn quantize_with_rotated_and_ip(
+        &self,
+        vectors: &FixedSizeListArray,
+        keep_rotated: bool,
+    ) -> Result<(ArrayRef, Vec<f32>, Option<FixedSizeListArray>)> {
+        match vectors.value_type() {
+            DataType::Float16 => self.transform_with_rotated::<Float16Type>(vectors, keep_rotated),
+            DataType::Float32 => self.transform_with_rotated::<Float32Type>(vectors, keep_rotated),
+            DataType::Float64 => self.transform_with_rotated::<Float64Type>(vectors, keep_rotated),
+            value_type => Err(Error::invalid_input(
+                format!("Unsupported data type: {:?}", value_type),
+                location!(),
+            )),
+        }
     }
 
     fn transform<T: ArrowFloatType>(
@@ -148,10 +145,23 @@ impl RabitQuantizer {
     where
         T::Native: AsPrimitive<f32>,
     {
+        let (codes, _, _) = self.transform_with_rotated::<T>(residual_vectors, false)?;
+        Ok(codes)
+    }
+
+    fn transform_with_rotated<T: ArrowFloatType>(
+        &self,
+        residual_vectors: &FixedSizeListArray,
+        keep_rotated: bool,
+    ) -> Result<(ArrayRef, Vec<f32>, Option<FixedSizeListArray>)>
+    where
+        T::Native: AsPrimitive<f32>,
+    {
         // we don't need to normalize the residual vectors,
         // because the sign of P^{-1} * v_r is the same as P^{-1} * v_r / ||v_r||
         let n = residual_vectors.len();
         let dim = self.dim();
+        let code_dim = self.code_dim();
         debug_assert_eq!(residual_vectors.values().len(), n * dim);
 
         let vectors = ndarray::ArrayView2::from_shape(
@@ -165,19 +175,50 @@ impl RabitQuantizer {
         )
         .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         let vectors = vectors.t();
+
         let rotate_mat = self.rotate_mat::<T>();
         let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
         let rotated_vectors = rotate_mat.dot(&vectors);
 
-        let quantized_vectors = rotated_vectors.t().mapv(|v| v.as_().is_sign_positive());
-        let bv: BitVec<u8, Lsb0> = BitVec::from_iter(quantized_vectors);
+        let sqrt_dim = (dim as f32 * self.metadata.num_bits as f32).sqrt();
+        let mut ip_rq_res = Vec::with_capacity(n);
+        for vec_idx in 0..n {
+            let sum_abs = (0..code_dim)
+                .map(|j| rotated_vectors[(j, vec_idx)].as_().abs())
+                .sum::<f32>();
+            ip_rq_res.push(sum_abs / sqrt_dim);
+        }
 
+        let bv: BitVec<u8, Lsb0> = BitVec::from_iter(
+            rotated_vectors
+                .t()
+                .iter()
+                .map(|v| v.as_().is_sign_positive()),
+        );
         let codes = UInt8Array::from(bv.into_vec());
-        debug_assert_eq!(codes.len(), n * self.code_dim() / u8::BITS as usize);
-        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+        debug_assert_eq!(codes.len(), n * code_dim / u8::BITS as usize);
+        let codes = Arc::new(FixedSizeListArray::try_new_from_values(
             codes,
-            self.code_dim() as i32 / u8::BITS as i32, // num_bits -> num_bytes
-        )?))
+            code_dim as i32 / u8::BITS as i32, // num_bits -> num_bytes
+        )?);
+
+        let rotated_vectors = if keep_rotated {
+            let mut rotated_values = Vec::with_capacity(n * code_dim);
+            for vec_idx in 0..n {
+                for j in 0..code_dim {
+                    rotated_values.push(rotated_vectors[(j, vec_idx)].as_());
+                }
+            }
+            let rotated_values = Float32Array::from(rotated_values);
+            Some(FixedSizeListArray::try_new_from_values(
+                rotated_values,
+                code_dim as i32,
+            )?)
+        } else {
+            None
+        };
+
+        Ok((codes, ip_rq_res, rotated_vectors))
     }
 }
 

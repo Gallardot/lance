@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::future;
 use std::sync::Arc;
+use std::time::Instant;
 use std::{collections::HashMap, pin::Pin};
 
 use arrow::array::{AsArray as _, PrimitiveBuilder, UInt32Builder, UInt64Builder};
@@ -774,6 +775,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         _ => partition,
                     };
                     async move {
+                        log::info!("taking partition {} batches", partition);
+                        let start = Instant::now();
                         let (mut batches, loss) = if skip_existing_batches {
                             (Vec::new(), 0.0)
                         } else {
@@ -784,7 +787,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             )
                             .await?
                         };
-
+                        let end = Instant::now();
+                        log::info!("took partition {} batches in {:?}", partition, end - start);
                         if let Some((assign_batch, deleted_row_ids)) = assign_batch {
                             if !deleted_row_ids.is_empty() {
                                 let deleted_row_ids = HashSet::<u64>::from_iter(
@@ -840,14 +844,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             return Ok(None);
                         }
 
-                        let (storage, sub_index) = Self::build_index(
-                            distance_type,
-                            quantizer,
-                            sub_index_params,
-                            batches,
-                            column,
-                            frag_reuse_index,
-                        )?;
+                        let (storage, sub_index) = spawn_cpu(move || {
+                            Self::build_index(
+                                distance_type,
+                                quantizer,
+                                sub_index_params,
+                                batches,
+                                column,
+                                frag_reuse_index,
+                            )
+                        })
+                        .await?;
                         Ok(Some((storage, sub_index, loss)))
                     }
                 });
@@ -867,7 +874,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<(Q::Storage, S)> {
         let mut storage_builder =
-            StorageBuilder::new(column, distance_type, quantizer, frag_reuse_index)?;
+            StorageBuilder::new(column.clone(), distance_type, quantizer, frag_reuse_index)?;
 
         if Q::quantization_type() == QuantizationType::Rabit
             && matches!(SubIndexType::try_from(S::name()), Ok(SubIndexType::Hnsw))
@@ -878,8 +885,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             });
         }
 
-        let storage = storage_builder.build(batches)?;
+        let start = Instant::now();
+        let mut storage = storage_builder.build(batches)?;
+        let end = Instant::now();
+        log::info!("built storage in {:?}", end - start);
+        let start = Instant::now();
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
+        let end = Instant::now();
+        log::info!("indexed storage in {:?}", end - start);
+        // Drop the vector column from the storage
+        // This is for only HNSW_RQ, which requires the vector column for building the index.
+        storage.drop_column(&column)?;
 
         Ok((storage, sub_index))
     }

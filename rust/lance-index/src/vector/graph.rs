@@ -6,7 +6,6 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
 use bitvec::vec::BitVec;
@@ -158,7 +157,7 @@ pub trait Graph {
     }
 
     /// Get the neighbors of a graph node, identifyied by the index.
-    fn neighbors(&self, key: u32) -> Arc<Vec<u32>>;
+    fn neighbors(&self, key: u32) -> &[u32];
 }
 
 /// Array-based visited list (faster than HashSet)
@@ -345,7 +344,7 @@ pub fn beam_search(
         };
         let neighbors = graph.neighbors(current.id);
         process_neighbors_with_look_ahead(
-            &neighbors,
+            neighbors,
             process_neighbor,
             prefetch_distance,
             dist_calc,
@@ -393,7 +392,7 @@ pub fn greedy_search(
             }
         };
         process_neighbors_with_look_ahead(
-            &neighbors,
+            neighbors,
             process_neighbor,
             prefetch_distance,
             dist_calc,

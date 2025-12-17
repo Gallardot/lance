@@ -119,7 +119,10 @@ pub struct RabitQuantizationStorage {
     codes: FixedSizeListArray,
     add_factors: Float32Array,
     scale_factors: Float32Array,
-    residual_vectors: Option<FixedSizeListArray>,
+    /// Build-time only: rotated residual vectors (Float32).
+    ///
+    /// This column is expected to be dropped before persisting the storage.
+    rotated_vectors: Option<FixedSizeListArray>,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -155,6 +158,37 @@ impl RabitQuantizationStorage {
             .chunks_exact(code_dim)
             .map(|chunk| lance_linalg::distance::dot(&chunk[..d], qr))
             .collect()
+    }
+
+    fn dist_calculator_from_rotated_qr(
+        &self,
+        rotated_qr: &Float32Array,
+        dist_q_c: f32,
+    ) -> RabitDistCalculator<'_> {
+        let codes = self.codes.values().as_primitive::<UInt8Type>().values();
+        let dist_table = build_dist_table_direct::<Float32Type>(rotated_qr.values());
+        let sum_q: f32 = rotated_qr.values().iter().copied().sum();
+
+        let q_factor = match self.distance_type {
+            DistanceType::L2 => dist_q_c,
+            DistanceType::Cosine | DistanceType::Dot => dist_q_c - 1.0,
+            _ => unimplemented!(
+                "RabitQ does not support distance type: {}",
+                self.distance_type
+            ),
+        };
+
+        RabitDistCalculator::new(
+            rotated_qr.len(),
+            self.metadata.num_bits,
+            dist_table,
+            sum_q,
+            codes,
+            self.metadata.packed,
+            self.add_factors.values(),
+            self.scale_factors.values(),
+            q_factor,
+        )
     }
 
     fn dist_calculator_from_codes(&self, id: usize) -> RabitDistCalculator<'_> {
@@ -521,12 +555,14 @@ impl VectorStore for RabitQuantizationStorage {
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let id = id as usize;
 
-        // Prefer exact residual vectors when available (build-time only), otherwise fall back to a
+        // Prefer rotated residual vectors when available (build-time only), otherwise fall back to a
         // coarse reconstruction from Rabit codes.
-        if let Some(residual_vectors) = self.residual_vectors.as_ref() {
-            if !residual_vectors.is_null(id) {
+        if let Some(rotated_vectors) = self.rotated_vectors.as_ref() {
+            if !rotated_vectors.is_null(id) {
+                let rotated_qr = rotated_vectors.value(id);
+                let rotated_qr = rotated_qr.as_primitive::<Float32Type>();
                 let dist_q_c = self.add_factors.value(id);
-                return self.dist_calculator(residual_vectors.value(id), dist_q_c);
+                return self.dist_calculator_from_rotated_qr(rotated_qr, dist_q_c);
             }
         }
 
@@ -702,14 +738,11 @@ impl QuantizerStorage for RabitQuantizationStorage {
             .as_primitive::<Float32Type>()
             .clone();
 
-        // Build-time only: if present, keep a handle to the residual vector column so HNSW can
-        // build using exact residual vectors. This column should be dropped before persisting.
-        let residual_vectors = batch.columns().iter().find_map(|arr| {
+        // Build-time only: keep a handle to the rotated residual vector column (Float32).
+        // This column should be dropped before persisting.
+        let rotated_vectors = batch.columns().iter().find_map(|arr| {
             let fsl = arr.as_fixed_size_list_opt()?;
-            match fsl.value_type() {
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(fsl.clone()),
-                _ => None,
-            }
+            (fsl.value_type() == DataType::Float32).then(|| fsl.clone())
         });
 
         Ok(Self {
@@ -720,7 +753,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             codes,
             add_factors,
             scale_factors,
-            residual_vectors,
+            rotated_vectors,
         })
     }
 
@@ -797,12 +830,9 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 .replace_column_by_name(RABIT_CODE_COLUMN, codes)?
         };
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
-        let residual_vectors = batch.columns().iter().find_map(|arr| {
+        let rotated_vectors = batch.columns().iter().find_map(|arr| {
             let fsl = arr.as_fixed_size_list_opt()?;
-            match fsl.value_type() {
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(fsl.clone()),
-                _ => None,
-            }
+            (fsl.value_type() == DataType::Float32).then(|| fsl.clone())
         });
 
         Ok(Self {
@@ -813,8 +843,13 @@ impl QuantizerStorage for RabitQuantizationStorage {
             add_factors: self.add_factors.clone(),
             scale_factors: self.scale_factors.clone(),
             row_ids: new_row_ids,
-            residual_vectors,
+            rotated_vectors,
         })
+    }
+
+    fn drop_column(&mut self, column: &str) -> Result<()> {
+        self.batch = self.batch.drop_column(column)?;
+        Ok(())
     }
 }
 
@@ -1099,16 +1134,22 @@ mod tests {
     }
 
     #[test]
-    fn test_dist_calculator_from_id_prefers_residual_vectors_when_present() {
+    fn test_dist_calculator_from_id_uses_rotated_vectors_when_present() {
         let dim = 8;
         let num_bits = 1_u8;
         let code_len = 1; // dim * num_bits / 8
 
-        // Identity rotate matrix (code_dim == dim for num_bits == 1)
+        // A simple rotation matrix that swaps the first two dimensions.
         let mut rotate_mat_values = Vec::with_capacity(dim * dim);
         for row in 0..dim {
             for col in 0..dim {
-                rotate_mat_values.push(if row == col { 1.0_f32 } else { 0.0 });
+                let v = match (row, col) {
+                    (0, 1) => 1.0_f32,
+                    (1, 0) => 1.0_f32,
+                    _ if row == col && row >= 2 => 1.0_f32,
+                    _ => 0.0_f32,
+                };
+                rotate_mat_values.push(v);
             }
         }
         let rotate_mat = FixedSizeListArray::try_new_from_values(
@@ -1128,17 +1169,26 @@ mod tests {
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0x00, 0xFF]), code_len)
                 .unwrap();
         let codes_data_type = codes.data_type().clone();
-        let add_factors = Float32Array::from(vec![0.0_f32, 0.0_f32]);
+        let add_factors = Float32Array::from(vec![0.5_f32, 0.0_f32]);
         let scale_factors = Float32Array::from(vec![1.0_f32, 1.0_f32]);
 
-        // Residual vectors exist and are valid for both rows; row 0 is all zeros.
-        let residual_values = Float32Array::from(vec![0.0_f32; 2 * dim]);
-        let residuals =
-            FixedSizeListArray::try_new_from_values(residual_values, dim as i32).unwrap();
+        // Store rotated residual vectors (column name stays the same).
+        let raw0 = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let raw1 = vec![8.0_f32, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let rotate = |v: &[f32]| {
+            let mut out = v.to_vec();
+            out.swap(0, 1);
+            out
+        };
+        let rotated0 = rotate(&raw0);
+        let rotated1 = rotate(&raw1);
+        let rotated_values = Float32Array::from([rotated0, rotated1].concat());
+        let rotated_vectors =
+            FixedSizeListArray::try_new_from_values(rotated_values, dim as i32).unwrap();
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, true),
-            arrow_schema::Field::new("residual", residuals.data_type().clone(), true),
+            arrow_schema::Field::new("residual", rotated_vectors.data_type().clone(), true),
             arrow_schema::Field::new(RABIT_CODE_COLUMN, codes_data_type.clone(), true),
             arrow_schema::Field::new(ADD_FACTORS_COLUMN, DataType::Float32, true),
             arrow_schema::Field::new(SCALE_FACTORS_COLUMN, DataType::Float32, true),
@@ -1147,7 +1197,7 @@ mod tests {
             schema,
             vec![
                 Arc::new(row_ids),
-                Arc::new(residuals),
+                Arc::new(rotated_vectors),
                 Arc::new(codes),
                 Arc::new(add_factors),
                 Arc::new(scale_factors),
@@ -1159,14 +1209,13 @@ mod tests {
             RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
                 .unwrap();
 
+        let dist_q_c0 = 0.5_f32;
+        let query0: ArrayRef = Arc::new(Float32Array::from(raw0));
+        let dist_from_query = storage.dist_calculator(query0, dist_q_c0).distance(1);
         let dist_from_id = storage.dist_calculator_from_id(0).distance(1);
-        let dist_from_codes = storage.dist_calculator_from_codes(0).distance(1);
+        assert_eq!(dist_from_id, dist_from_query);
 
-        // With a zero residual query, the distance table is all zeros, so the distance is exactly 0.
-        assert_eq!(dist_from_id, 0.0);
-        assert_ne!(dist_from_codes, 0.0);
-
-        // If the residual vector is present but null, we should fall back to code-based reconstruction.
+        // If the rotated vector is present but null, we should fall back to code-based reconstruction.
         let residual_values = Float32Array::from(vec![0.0_f32; 2 * dim]);
         let nulls = NullBuffer::from(vec![false, true]);
         let residuals_null = FixedSizeListArray::try_new(

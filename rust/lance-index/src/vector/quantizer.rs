@@ -283,6 +283,14 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         metadata: &Self::Metadata,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
+
+    /// Drop a column from the underlying in-memory storage, if supported.
+    ///
+    /// This is a build-time escape hatch for indices that temporarily carry extra columns.
+    /// Most storage implementations can ignore this (default no-op).
+    fn drop_column(&mut self, _column: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Loader to load partitioned [VectorStore] from disk.

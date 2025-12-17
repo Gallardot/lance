@@ -5,9 +5,8 @@ use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::AsArray;
-use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type};
+use arrow::datatypes::{Float32Type, UInt32Type};
 use arrow_array::{Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch};
-use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{norm_squared_fsl, DistanceType};
@@ -129,32 +128,12 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let rq_codes = self.rq.quantize(&residual_vectors)?;
+        let keep_rotated = !self.drop_vector_column;
+        let (rq_codes, ip_rq_res, rotated_vectors) = self
+            .rq
+            .quantize_with_rotated_and_ip(residual_vectors, keep_rotated)?;
+        let ip_rq_res = Float32Array::from(ip_rq_res);
         let codes_fsl = rq_codes.as_fixed_size_list();
-
-        let ip_rq_res = match residual_vectors.value_type() {
-            DataType::Float16 => Float32Array::from(
-                self.rq
-                    .codes_res_dot_dists::<Float16Type>(residual_vectors)?,
-            ),
-            DataType::Float32 => Float32Array::from(
-                self.rq
-                    .codes_res_dot_dists::<Float32Type>(residual_vectors)?,
-            ),
-            DataType::Float64 => Float32Array::from(
-                self.rq
-                    .codes_res_dot_dists::<Float64Type>(residual_vectors)?,
-            ),
-            _ => {
-                return Err(Error::Index {
-                    message: format!(
-                        "RQ Transform: unsupported residual vector data type: {}",
-                        residual_vectors.data_type()
-                    ),
-                    location: location!(),
-                });
-            }
-        };
         debug_assert_eq!(codes_fsl.len(), batch.num_rows());
 
         let add_factors = match self.distance_type {
@@ -218,12 +197,27 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let mut batch = batch.try_with_column(self.rq.field(), Arc::new(rq_codes))?;
+        let mut batch = batch.try_with_column(self.rq.field(), rq_codes)?;
         batch = batch.try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?;
         batch = batch.try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
 
         // `CENTROID_DIST_COLUMN` is an intermediate value for quantization only.
         batch = batch.drop_column(CENTROID_DIST_COLUMN)?;
+
+        if keep_rotated {
+            let rotated_vectors = rotated_vectors.expect("keep_rotated implies rotated_vectors");
+            // Replace the residual vector column with the rotated residual vector column (Float32).
+            if rotated_vectors.data_type() != residual_vectors.data_type() {
+                batch = batch.replace_column_schema_by_name(
+                    &self.vector_column,
+                    rotated_vectors.data_type().clone(),
+                    Arc::new(rotated_vectors),
+                )?;
+            } else {
+                batch =
+                    batch.replace_column_by_name(&self.vector_column, Arc::new(rotated_vectors))?;
+            }
+        }
 
         if self.drop_vector_column {
             batch = batch.drop_column(&self.vector_column)?;
