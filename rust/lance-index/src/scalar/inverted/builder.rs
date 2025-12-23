@@ -531,6 +531,7 @@ struct IndexWorker {
     total_doc_length: usize,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
+    token_occurrences: HashMap<u32, PositionRecorder>,
 }
 
 impl IndexWorker {
@@ -560,6 +561,7 @@ impl IndexWorker {
             total_doc_length: 0,
             fragment_mask,
             token_set_format,
+            token_occurrences: HashMap::new(),
         })
     }
 
@@ -577,7 +579,7 @@ impl IndexWorker {
 
         let with_position = self.has_position();
         for (doc, row_id) in docs {
-            let mut token_occurrences = HashMap::new();
+            self.token_occurrences.clear();
             let mut token_num = 0;
             {
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
@@ -585,7 +587,7 @@ impl IndexWorker {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
                     let token_id = self.builder.tokens.add(token_text) as usize;
-                    token_occurrences
+                    self.token_occurrences
                         .entry(token_id as u32)
                         .or_insert_with(|| PositionRecorder::new(with_position))
                         .push(token.position as u32);
@@ -600,16 +602,14 @@ impl IndexWorker {
             let doc_id = self.builder.docs.append(row_id, token_num);
             self.total_doc_length += doc.len();
 
-            token_occurrences
-                .into_iter()
-                .for_each(|(token_id, term_positions)| {
-                    let posting_list = &mut self.builder.posting_lists[token_id as usize];
+            for (token_id, term_positions) in self.token_occurrences.drain() {
+                let posting_list = &mut self.builder.posting_lists[token_id as usize];
 
-                    let old_size = posting_list.size();
-                    posting_list.add(doc_id, term_positions);
-                    let new_size = posting_list.size();
-                    self.estimated_size += new_size - old_size;
-                });
+                let old_size = posting_list.size();
+                posting_list.add(doc_id, term_positions);
+                let new_size = posting_list.size();
+                self.estimated_size += new_size - old_size;
+            }
 
             if self.builder.docs.len() as u32 == u32::MAX
                 || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 20

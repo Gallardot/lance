@@ -40,14 +40,8 @@ pub fn compress_posting_list<'a>(
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(
-            doc_ids.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
-        compress_remainder(
-            frequencies.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
+        compress_remainder(doc_ids, &mut builder)?;
+        compress_remainder(frequencies, &mut builder)?;
         builder.append_value("");
         return Ok(builder.finish());
     }
@@ -83,8 +77,8 @@ pub fn compress_posting_list<'a>(
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(&doc_id_buffer, &mut builder)?;
-        compress_remainder(&freq_buffer, &mut builder)?;
+        compress_remainder(doc_id_buffer.iter(), &mut builder)?;
+        compress_remainder(freq_buffer.iter(), &mut builder)?;
         builder.append_value("");
     }
     Ok(builder.finish())
@@ -116,8 +110,11 @@ fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuil
 }
 
 #[inline]
-fn compress_remainder(data: &[u32], builder: &mut LargeBinaryBuilder) -> Result<()> {
-    for value in data.iter() {
+fn compress_remainder<'a, I>(data: I, builder: &mut LargeBinaryBuilder) -> Result<()>
+where
+    I: IntoIterator<Item = &'a u32>,
+{
+    for value in data {
         let _ = builder.write(value.to_le_bytes().as_ref())?;
     }
     Ok(())
@@ -144,7 +141,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
     let length = positions.len();
     let remainder = length % BLOCK_SIZE;
     if remainder > 0 {
-        compress_remainder(&positions[length - remainder..], &mut builder)?;
+        compress_remainder(positions[length - remainder..].iter(), &mut builder)?;
         builder.append_value("");
     }
 

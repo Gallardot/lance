@@ -1810,13 +1810,11 @@ pub struct PostingListBuilder {
 
 impl PostingListBuilder {
     pub fn size(&self) -> u64 {
-        (std::mem::size_of::<u32>() * self.doc_ids.len()
-            + std::mem::size_of::<u32>() * self.frequencies.len()
-            + self
-                .positions
-                .as_ref()
-                .map(|positions| positions.size())
-                .unwrap_or(0)) as u64
+        let mut size = self.doc_ids.size() + self.frequencies.size();
+        if let Some(positions) = self.positions.as_ref() {
+            size += positions.size();
+        }
+        size as u64
     }
 
     pub fn has_positions(&self) -> bool {
@@ -1953,8 +1951,9 @@ impl PositionBuilder {
     }
 
     pub fn size(&self) -> usize {
-        std::mem::size_of::<u32>() * self.positions.len()
-            + std::mem::size_of::<i32>() * self.offsets.len()
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<u32>() * self.positions.capacity()
+            + std::mem::size_of::<i32>() * self.offsets.capacity()
     }
 
     pub fn total_len(&self) -> usize {
