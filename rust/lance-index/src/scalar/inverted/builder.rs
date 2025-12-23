@@ -528,6 +528,8 @@ struct IndexWorker {
     partitions: Vec<u64>,
     schema: SchemaRef,
     estimated_size: u64,
+    docs_size: u64,
+    tokens_size: u64,
     total_doc_length: usize,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
@@ -544,20 +546,26 @@ impl IndexWorker {
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
+        let builder = InnerBuilder::new(
+            id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                | fragment_mask.unwrap_or(0),
+            with_position,
+            token_set_format,
+        );
+        let docs_size = builder.docs.size();
+        let tokens_size = builder.tokens.estimated_size();
+        let estimated_size = docs_size + tokens_size;
 
         Ok(Self {
             store,
             tokenizer,
-            builder: InnerBuilder::new(
-                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    | fragment_mask.unwrap_or(0),
-                with_position,
-                token_set_format,
-            ),
+            builder,
             partitions: Vec::new(),
             id_alloc,
             schema,
-            estimated_size: 0,
+            estimated_size,
+            docs_size,
+            tokens_size,
             total_doc_length: 0,
             fragment_mask,
             token_set_format,
@@ -594,12 +602,18 @@ impl IndexWorker {
                     token_num += 1;
                 }
             }
+            let new_tokens_size = self.builder.tokens.estimated_size();
+            self.estimated_size += new_tokens_size - self.tokens_size;
+            self.tokens_size = new_tokens_size;
             self.builder
                 .posting_lists
                 .resize_with(self.builder.tokens.len(), || {
                     PostingListBuilder::new(with_position)
                 });
             let doc_id = self.builder.docs.append(row_id, token_num);
+            let new_docs_size = self.builder.docs.size();
+            self.estimated_size += new_docs_size - self.docs_size;
+            self.docs_size = new_docs_size;
             self.total_doc_length += doc.len();
 
             for (token_id, term_positions) in self.token_occurrences.drain() {
@@ -631,7 +645,6 @@ impl IndexWorker {
             "flushing posting lists, estimated size: {} MiB",
             self.estimated_size / (1024 * 1024)
         );
-        self.estimated_size = 0;
         let with_position = self.has_position();
         let mut builder = std::mem::replace(
             &mut self.builder,
@@ -645,6 +658,9 @@ impl IndexWorker {
         );
         builder.write(self.store.as_ref()).await?;
         self.partitions.push(builder.id());
+        self.docs_size = self.builder.docs.size();
+        self.tokens_size = self.builder.tokens.estimated_size();
+        self.estimated_size = self.docs_size + self.tokens_size;
         Ok(())
     }
 

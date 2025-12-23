@@ -123,6 +123,8 @@ impl Merger for SizeBasedMerger<'_> {
                 estimated_size = 0;
             }
 
+            let old_tokens_size = self.builder.tokens.estimated_size();
+            let old_docs_size = self.builder.docs.size();
             let mut inv_token = HashMap::with_capacity(part.tokens.len());
             // merge token set
             for (token, token_id) in part.tokens.iter() {
@@ -134,6 +136,10 @@ impl Merger for SizeBasedMerger<'_> {
             for (row_id, num_tokens) in part.docs.iter() {
                 self.builder.docs.append(*row_id, *num_tokens);
             }
+            let new_tokens_size = self.builder.tokens.estimated_size();
+            let new_docs_size = self.builder.docs.size();
+            estimated_size += new_tokens_size - old_tokens_size;
+            estimated_size += new_docs_size - old_docs_size;
             // merge posting lists
             self.builder
                 .posting_lists

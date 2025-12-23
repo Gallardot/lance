@@ -1115,6 +1115,18 @@ impl TokenSet {
         token_id
     }
 
+    pub fn estimated_size(&self) -> u64 {
+        let base = std::mem::size_of::<Self>();
+        match &self.tokens {
+            TokenMap::HashMap(map) => {
+                let buckets = map.capacity() * std::mem::size_of::<(String, u32)>();
+                let heap = self.total_length;
+                (base + buckets + heap) as u64
+            }
+            TokenMap::Fst(map) => (base + map.as_fst().size()) as u64,
+        }
+    }
+
     pub fn get(&self, token: &str) -> Option<u32> {
         match self.tokens {
             TokenMap::HashMap(ref map) => map.get(token).copied(),
@@ -2105,6 +2117,14 @@ impl DocSet {
     #[inline]
     pub fn len(&self) -> usize {
         self.row_ids.len()
+    }
+
+    pub fn size(&self) -> u64 {
+        let base = std::mem::size_of::<Self>();
+        let row_ids = self.row_ids.capacity() * std::mem::size_of::<u64>();
+        let num_tokens = self.num_tokens.capacity() * std::mem::size_of::<u32>();
+        let inv = self.inv.capacity() * std::mem::size_of::<(u64, u32)>();
+        (base + row_ids + num_tokens + inv) as u64
     }
 
     pub fn is_empty(&self) -> bool {
