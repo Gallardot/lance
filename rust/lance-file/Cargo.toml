@@ -42,6 +42,7 @@ tracing.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
 criterion.workspace = true
+jemallocator = "0.5"
 rand.workspace = true
 rstest.workspace = true
 proptest.workspace = true
