@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
-use std::sync::{Arc, LazyLock, Weak};
+use std::convert::Infallible;
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
@@ -1782,15 +1783,26 @@ impl DecompressedBlockCache {
             return block;
         }
 
-        let decompressed =
-            Arc::new(DecompressedBlock::decompress(block, block_idx, num_blocks, length));
-
-        if let Some(existing) = self.try_get(block_idx) {
-            return existing;
+        loop {
+            let created = OnceLock::new();
+            let weak = self
+                .blocks
+                .try_get_with(block_idx, || {
+                    let decompressed = Arc::new(DecompressedBlock::decompress(
+                        block, block_idx, num_blocks, length,
+                    ));
+                    let _ = created.set(decompressed.clone());
+                    Ok::<_, Infallible>(Arc::downgrade(&decompressed))
+                })
+                .expect("infallible weak cache insert");
+            if let Some(block) = created.get() {
+                return block.clone();
+            }
+            if let Some(block) = weak.upgrade() {
+                return block;
+            }
+            self.blocks.invalidate(&block_idx);
         }
-        self.blocks
-            .insert(block_idx, Arc::downgrade(&decompressed));
-        decompressed
     }
 
     fn try_get(&self, block_idx: usize) -> Option<Arc<DecompressedBlock>> {
