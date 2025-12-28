@@ -234,7 +234,7 @@ impl DatasetBuilder {
 
     /// Sets `version` for the builder using a tag
     pub fn with_tag(mut self, tag: &str) -> Self {
-        self.version = Some(Ref::from(tag));
+        self.version = Some(Ref::Tag(tag.to_string()));
         self
     }
 

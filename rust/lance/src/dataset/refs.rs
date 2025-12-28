@@ -37,65 +37,6 @@ pub enum Ref {
     Tag(String),
 }
 
-impl std::str::FromStr for Ref {
-    type Err = Error;
-
-    fn from_str(reference: &str) -> std::result::Result<Self, Self::Err> {
-        let reference = reference.trim();
-        if reference.is_empty() {
-            return Err(Error::InvalidRef {
-                message: "Ref cannot be empty".to_string(),
-            });
-        }
-
-        if let Some((branch, version)) = reference.split_once(':') {
-            if branch.is_empty() {
-                return Err(Error::InvalidRef {
-                    message: "Branch name cannot be empty".to_string(),
-                });
-            }
-
-            let branch = if branch == MAIN_BRANCH {
-                None
-            } else {
-                check_valid_branch(branch)?;
-                Some(branch.to_string())
-            };
-
-            let version = match version {
-                "" | "latest" => None,
-                v => {
-                    let v = v.parse::<u64>().map_err(|e| Error::InvalidRef {
-                        message: format!("Failed to parse version number '{}': {}", v, e),
-                    })?;
-                    Some(v)
-                }
-            };
-
-            return Ok(Self::Version(branch, version));
-        }
-
-        if reference == MAIN_BRANCH {
-            return Ok(Self::Version(None, None));
-        }
-
-        if reference.chars().all(|c| c.is_ascii_digit()) {
-            let v = reference.parse::<u64>().map_err(|e| Error::InvalidRef {
-                message: format!("Failed to parse version number '{}': {}", reference, e),
-            })?;
-            return Ok(Self::VersionNumber(v));
-        }
-
-        if reference.contains('/') {
-            check_valid_branch(reference)?;
-            return Ok(Self::Version(Some(reference.to_string()), None));
-        }
-
-        check_valid_tag(reference)?;
-        Ok(Self::Tag(reference.to_string()))
-    }
-}
-
 impl From<u64> for Ref {
     fn from(reference: u64) -> Self {
         VersionNumber(reference)
@@ -104,7 +45,48 @@ impl From<u64> for Ref {
 
 impl From<&str> for Ref {
     fn from(reference: &str) -> Self {
+        let reference = reference.trim();
+        if let Some((branch, version)) = reference.split_once(':') {
+            if branch.is_empty() {
+                return Tag(reference.to_string());
+            }
+
+            let branch = if branch == MAIN_BRANCH {
+                None
+            } else if check_valid_branch(branch).is_ok() {
+                Some(branch.to_string())
+            } else {
+                return Tag(reference.to_string());
+            };
+
+            let version = match version {
+                "" | "latest" => None,
+                v => match v.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(_) => return Tag(reference.to_string()),
+                },
+            };
+
+            return Version(branch, version);
+        }
+
+        if reference == MAIN_BRANCH {
+            return Version(None, None);
+        }
+
+        if reference.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(v) = reference.parse::<u64>() {
+                return VersionNumber(v);
+            }
+        }
+
         Tag(reference.to_string())
+    }
+}
+
+impl From<String> for Ref {
+    fn from(reference: String) -> Self {
+        Ref::from(reference.as_str())
     }
 }
 
@@ -882,7 +864,6 @@ mod tests {
             ("main:", Ref::Version(None, None)),
             ("main:latest", Ref::Version(None, None)),
             ("main:10", Ref::Version(None, Some(10))),
-            ("feature/a", Ref::Version(Some("feature/a".to_string()), None)),
             ("feature/a:", Ref::Version(Some("feature/a".to_string()), None)),
             ("feature/a:latest", Ref::Version(Some("feature/a".to_string()), None)),
             ("feature/a:10", Ref::Version(Some("feature/a".to_string()), Some(10))),
@@ -890,22 +871,23 @@ mod tests {
     )]
         (input, expected): (&str, Ref),
     ) {
-        assert_eq!(input.parse::<Ref>().unwrap(), expected);
+        assert_eq!(Ref::from(input), expected);
     }
 
     #[rstest]
-    fn test_parse_ref_err(
+    fn test_ref_from_str_invalid_syntax_falls_back_to_tag(
         #[values(
             "",
             ":",
             ":10",
             "main:bad",
+            "feature/a",
             "/start-with-slash",
             "feature//double-slash"
         )]
         input: &str,
     ) {
-        assert!(input.parse::<Ref>().is_err());
+        assert_eq!(Ref::from(input), Ref::Tag(input.trim().to_string()));
     }
 
     #[rstest]
