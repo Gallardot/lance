@@ -797,7 +797,7 @@ impl InvertedPartition {
             token_ids.dedup_by_key(|(token_id, _)| *token_id);
         }
 
-        let prefetched = if !self.is_legacy() && (PREFETCH_PREFIX_NUM > 0 || PREFETCH_TOP_NUM > 0) {
+        let prefetched = if !self.is_legacy() {
             let inverted_list = self.inverted_list.clone();
             let token_ids = token_ids
                 .iter()
@@ -1560,25 +1560,24 @@ impl PostingListReader {
         let mut requests = Vec::new();
         let mut selected = HashSet::new();
 
-        if PREFETCH_PREFIX_NUM > 0 {
-            for block_idx in 0..PREFETCH_PREFIX_NUM {
-                if let Some(request) = self.block_request(token_id, block_idx)? {
-                    if selected.insert(block_idx) {
-                        requests.push(request);
-                    }
-                } else {
-                    break;
+        for block_idx in 0..PREFETCH_PREFIX_NUM {
+            if let Some(request) = self.block_request(token_id, block_idx)? {
+                if selected.insert(block_idx) {
+                    requests.push(request);
                 }
+            } else {
+                break;
             }
         }
 
         if PREFETCH_TOP_NUM > 0 {
             if let Some(scores) = self.block_max_scores(token_id).await? {
                 let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
-                ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-                for (block_idx, _) in ranked.into_iter().take(PREFETCH_TOP_NUM) {
-                    if selected.insert(block_idx) {
-                        if let Some(request) = self.block_request(token_id, block_idx)? {
+                let (top_blcoks, _, _) =
+                    ranked.select_nth_unstable_by(PREFETCH_TOP_NUM, |a, b| b.1.total_cmp(&a.1));
+                for (block_idx, _) in top_blcoks {
+                    if selected.insert(*block_idx) {
+                        if let Some(request) = self.block_request(token_id, *block_idx)? {
                             requests.push(request);
                         }
                     }
