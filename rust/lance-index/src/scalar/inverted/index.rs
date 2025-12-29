@@ -100,8 +100,8 @@ pub const POSTING_COL: &str = "_posting";
 pub const MAX_SCORE_COL: &str = "_max_score";
 pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
-pub const PREFETCH_PREFIX_NUM: usize = 16;
-pub const PREFETCH_TOP_NUM: usize = 32;
+pub const PREFETCH_PREFIX_NUM_DEFAULT: usize = 16;
+pub const PREFETCH_TOP_NUM_DEFAULT: usize = 32;
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
@@ -112,6 +112,26 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+fn prefetch_prefix_num_from_env() -> usize {
+    match parse_env_usize("LANCE_FTS_PREFETCH_PREFIX_NUM") {
+        Some(value) if value >= 1 => value,
+        _ => PREFETCH_PREFIX_NUM_DEFAULT,
+    }
+}
+
+fn prefetch_top_num_from_env() -> usize {
+    parse_env_usize("LANCE_FTS_PREFETCH_TOP_NUM").unwrap_or(PREFETCH_TOP_NUM_DEFAULT)
+}
+
+pub static PREFETCH_PREFIX_NUM: LazyLock<usize> = LazyLock::new(prefetch_prefix_num_from_env);
+pub static PREFETCH_TOP_NUM: LazyLock<usize> = LazyLock::new(prefetch_top_num_from_env);
 
 #[derive(Debug)]
 struct PartitionCandidates {
@@ -1560,7 +1580,7 @@ impl PostingListReader {
         let mut requests = Vec::new();
         let mut selected = HashSet::new();
 
-        for block_idx in 0..PREFETCH_PREFIX_NUM {
+        for block_idx in 0..*PREFETCH_PREFIX_NUM {
             if let Some(request) = self.block_request(token_id, block_idx)? {
                 if selected.insert(block_idx) {
                     requests.push(request);
@@ -1570,14 +1590,14 @@ impl PostingListReader {
             }
         }
 
-        if PREFETCH_TOP_NUM > 0 {
+        if *PREFETCH_TOP_NUM > 0 {
             if let Some(scores) = self.block_max_scores(token_id).await? {
                 let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
-                let (top_blcoks, _, _) =
-                    ranked.select_nth_unstable_by(PREFETCH_TOP_NUM, |a, b| b.1.total_cmp(&a.1));
-                for (block_idx, _) in top_blcoks {
-                    if selected.insert(*block_idx) {
-                        if let Some(request) = self.block_request(token_id, *block_idx)? {
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let top_n = (*PREFETCH_TOP_NUM).min(ranked.len());
+                for (block_idx, _) in ranked.into_iter().take(top_n) {
+                    if selected.insert(block_idx) {
+                        if let Some(request) = self.block_request(token_id, block_idx)? {
                             requests.push(request);
                         }
                     }
@@ -3131,6 +3151,9 @@ mod tests {
     use crate::scalar::lance_format::LanceIndexStore;
 
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
@@ -3292,7 +3315,7 @@ mod tests {
             cache.clone(),
         ));
 
-        let num_blocks = PREFETCH_PREFIX_NUM + PREFETCH_TOP_NUM + 16;
+        let num_blocks = *PREFETCH_PREFIX_NUM + *PREFETCH_TOP_NUM + 16;
         let num_docs = BLOCK_SIZE * num_blocks;
         let mut posting_list = PostingListBuilder::new(false);
         for doc_id in 0..num_docs {
@@ -3300,7 +3323,7 @@ mod tests {
         }
 
         let mut block_max_scores = Vec::with_capacity(num_blocks);
-        let top_start = num_blocks - PREFETCH_TOP_NUM;
+        let top_start = num_blocks - *PREFETCH_TOP_NUM;
         for block_idx in 0..num_blocks {
             let score = if block_idx < top_start {
                 1.0
@@ -3330,16 +3353,45 @@ mod tests {
             .map(|request| request.block_idx)
             .collect::<HashSet<_>>();
 
-        assert_eq!(requested.len(), PREFETCH_PREFIX_NUM + PREFETCH_TOP_NUM);
-        for idx in 0..PREFETCH_PREFIX_NUM {
+        assert_eq!(requested.len(), *PREFETCH_PREFIX_NUM + *PREFETCH_TOP_NUM);
+        for idx in 0..*PREFETCH_PREFIX_NUM {
             assert!(requested.contains(&idx));
         }
         for idx in top_start..num_blocks {
             assert!(requested.contains(&idx));
         }
-        let middle_idx = PREFETCH_PREFIX_NUM + 1;
+        let middle_idx = *PREFETCH_PREFIX_NUM + 1;
         assert!(middle_idx < top_start);
         assert!(!requested.contains(&middle_idx));
+    }
+
+    #[test]
+    fn test_prefetch_env_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prefix_key = "LANCE_FTS_PREFETCH_PREFIX_NUM";
+        let top_key = "LANCE_FTS_PREFETCH_TOP_NUM";
+        let prev_prefix = std::env::var(prefix_key).ok();
+        let prev_top = std::env::var(top_key).ok();
+
+        std::env::set_var(prefix_key, "8");
+        std::env::set_var(top_key, "9");
+        assert_eq!(prefetch_prefix_num_from_env(), 8);
+        assert_eq!(prefetch_top_num_from_env(), 9);
+
+        std::env::set_var(prefix_key, "0");
+        assert_eq!(prefetch_prefix_num_from_env(), PREFETCH_PREFIX_NUM_DEFAULT);
+
+        std::env::remove_var(top_key);
+        assert_eq!(prefetch_top_num_from_env(), PREFETCH_TOP_NUM_DEFAULT);
+
+        match prev_prefix {
+            Some(value) => std::env::set_var(prefix_key, value),
+            None => std::env::remove_var(prefix_key),
+        }
+        match prev_top {
+            Some(value) => std::env::set_var(top_key, value),
+            None => std::env::remove_var(top_key),
+        }
     }
 
     #[tokio::test]
