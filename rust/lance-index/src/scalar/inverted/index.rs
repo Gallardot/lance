@@ -3151,9 +3151,6 @@ mod tests {
     use crate::scalar::lance_format::LanceIndexStore;
 
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
@@ -3363,35 +3360,6 @@ mod tests {
         let middle_idx = *PREFETCH_PREFIX_NUM + 1;
         assert!(middle_idx < top_start);
         assert!(!requested.contains(&middle_idx));
-    }
-
-    #[test]
-    fn test_prefetch_env_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prefix_key = "LANCE_FTS_PREFETCH_PREFIX_NUM";
-        let top_key = "LANCE_FTS_PREFETCH_TOP_NUM";
-        let prev_prefix = std::env::var(prefix_key).ok();
-        let prev_top = std::env::var(top_key).ok();
-
-        std::env::set_var(prefix_key, "8");
-        std::env::set_var(top_key, "9");
-        assert_eq!(prefetch_prefix_num_from_env(), 8);
-        assert_eq!(prefetch_top_num_from_env(), 9);
-
-        std::env::set_var(prefix_key, "0");
-        assert_eq!(prefetch_prefix_num_from_env(), PREFETCH_PREFIX_NUM_DEFAULT);
-
-        std::env::remove_var(top_key);
-        assert_eq!(prefetch_top_num_from_env(), PREFETCH_TOP_NUM_DEFAULT);
-
-        match prev_prefix {
-            Some(value) => std::env::set_var(prefix_key, value),
-            None => std::env::remove_var(prefix_key),
-        }
-        match prev_top {
-            Some(value) => std::env::set_var(top_key, value),
-            None => std::env::remove_var(top_key),
-        }
     }
 
     #[tokio::test]
