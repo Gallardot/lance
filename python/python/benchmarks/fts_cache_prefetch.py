@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import csv
 import json
 import os
 import subprocess
@@ -42,15 +43,16 @@ def run_single(args: argparse.Namespace) -> int:
     dataset = lance.LanceDataset(args.uri, session=session)
 
     query = build_query(args.query, args.columns)
-    scanner = dataset.scan(full_text_query=query, limit=args.limit)
+    scanner = dataset.scanner(full_text_query=query, limit=args.limit)
     table = scanner.to_table()
 
     result = {
         "prefix": int(os.environ.get("LANCE_FTS_PREFETCH_PREFIX_NUM", "0")),
         "top": int(os.environ.get("LANCE_FTS_PREFETCH_TOP_NUM", "0")),
+        "limit": args.limit,
         "rows": table.num_rows,
-        "index_cache_entries": dataset.index_cache_entry_count(),
-        "index_cache_hit_rate": dataset.index_cache_hit_rate(),
+        "index_cache_entries": dataset._ds.index_cache_entry_count(),
+        "index_cache_hit_rate": dataset._ds.index_cache_hit_rate(),
     }
     print(json.dumps(result))
     return 0
@@ -66,11 +68,14 @@ def parse_json_output(stdout: str) -> dict[str, object]:
 def run_matrix(args: argparse.Namespace) -> int:
     prefixes = parse_int_list(args.prefix)
     tops = parse_int_list(args.top)
+    limits = parse_int_list(args.limits) if args.limits else [args.limit]
     if not prefixes or not tops:
         raise ValueError("prefix and top lists must be non-empty")
+    if not limits:
+        raise ValueError("limits list must be non-empty")
 
     results: list[dict[str, object]] = []
-    for prefix, top in itertools.product(prefixes, tops):
+    for prefix, top, limit in itertools.product(prefixes, tops, limits):
         env = os.environ.copy()
         env["LANCE_FTS_PREFETCH_PREFIX_NUM"] = str(prefix)
         env["LANCE_FTS_PREFETCH_TOP_NUM"] = str(top)
@@ -84,7 +89,7 @@ def run_matrix(args: argparse.Namespace) -> int:
             "--query",
             args.query,
             "--limit",
-            str(args.limit),
+            str(limit),
         ]
         if args.columns:
             cmd.extend(["--columns", args.columns])
@@ -107,9 +112,11 @@ def run_matrix(args: argparse.Namespace) -> int:
         result = parse_json_output(proc.stdout)
         results.append(result)
         print(
-            "prefix={prefix} top={top} hit_rate={hit_rate:.4f} entries={entries} rows={rows}".format(
+            "prefix={prefix} top={top} limit={limit} hit_rate={hit_rate:.4f} "
+            "entries={entries} rows={rows}".format(
                 prefix=result["prefix"],
                 top=result["top"],
+                limit=result["limit"],
                 hit_rate=result["index_cache_hit_rate"],
                 entries=result["index_cache_entries"],
                 rows=result["rows"],
@@ -118,7 +125,20 @@ def run_matrix(args: argparse.Namespace) -> int:
 
     if args.output:
         output_path = Path(args.output)
-        output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        with output_path.open("w", encoding="utf-8", newline="") as output_file:
+            writer = csv.DictWriter(
+                output_file,
+                fieldnames=[
+                    "prefix",
+                    "top",
+                    "limit",
+                    "rows",
+                    "index_cache_entries",
+                    "index_cache_hit_rate",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(results)
 
     return 0
 
@@ -133,6 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query", required=True, help="Full text search query.")
     parser.add_argument("--columns", help="Comma-separated columns for full text search.")
     parser.add_argument("--limit", type=int, default=100, help="Limit for the full text search.")
+    parser.add_argument(
+        "--limits",
+        help="Comma-separated limit values to test (overrides --limit in matrix mode).",
+    )
     parser.add_argument(
         "--prefix",
         default="16",
