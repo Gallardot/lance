@@ -37,6 +37,7 @@ chrono.workspace = true
 deepsize.workspace = true
 futures.workspace = true
 log.workspace = true
+parking_lot.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 serde.workspace = true

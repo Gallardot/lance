@@ -48,7 +48,7 @@ use lance_core::{Error, Result};
 // Note: the number of threads here also impacts the number of files
 // we need to read in some situations.  So keeping this at 8 keeps the
 // RAM on our scanner down.
-pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
+pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 1024;
 // Cloud disks often need many many threads to saturate the network
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 

@@ -12,8 +12,7 @@ use std::task::{Context, Poll};
 
 /// Future that awaits completion of an io_uring read operation.
 ///
-/// This future holds a direct reference to the IoRequest and polls its
-/// completion flag without any global registry or HashMap lookups.
+/// This future is woken by the io_uring thread when the operation completes.
 pub(super) struct UringReadFuture {
     pub(super) request: Arc<IoRequest>,
 }
@@ -23,7 +22,9 @@ impl Future for UringReadFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.request.state.lock().unwrap();
+
         if state.completed {
+            // Operation completed - take the result
             match state.err.take() {
                 Some(err) => {
                     return Poll::Ready(Err(object_store::Error::Generic {
@@ -36,10 +37,10 @@ impl Future for UringReadFuture {
                     return Poll::Ready(Ok(bytes));
                 }
             }
+        } else {
+            // Operation not yet complete - store waker and return Pending
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
         }
-
-        state.waker = Some(cx.waker().clone());
-
-        Poll::Pending
     }
 }

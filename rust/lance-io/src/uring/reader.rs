@@ -5,7 +5,7 @@
 
 use super::future::UringReadFuture;
 use super::requests::IoRequest;
-use super::thread::URING_THREAD;
+use super::thread::{SUBMITTED_COUNTER, THREAD_SELECTOR, URING_THREADS};
 use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM};
 use crate::local::to_local_path;
 use crate::traits::Reader;
@@ -19,10 +19,11 @@ use object_store::path::Path;
 use snafu::location;
 use std::fs::File;
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::ops::Range;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tracing::instrument;
@@ -124,7 +125,7 @@ impl UringReader {
         }))
     }
 
-    /// Submit a read request to the io_uring thread and return a future.
+    /// Submit a read request to the io_uring thread via channel and return a future.
     fn submit_read(
         &self,
         offset: u64,
@@ -135,7 +136,7 @@ impl UringReader {
             buffer.set_len(length);
         }
 
-        // 3. Create IoRequest with all data
+        // Create IoRequest with all data
         let request = Arc::new(IoRequest {
             fd: self.handle.fd,
             offset,
@@ -148,28 +149,36 @@ impl UringReader {
             }),
         });
 
-        // 4. Clone Arc for future to hold
-        let future_request = Arc::clone(&request);
+        // Increment submitted counter before sending to channel
+        SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // 6. Send wrapped pointer via channel
-        // Note: This blocks if the channel is full, providing backpressure
-        if let Err(_e) = URING_THREAD.request_tx.send(request) {
-            // Channel closed, return error
-            return Box::pin(async move {
-                Err(object_store::Error::Generic {
-                    store: "UringReader",
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "io_uring thread disconnected",
-                    )),
+        // Select thread in round-robin fashion
+        let thread_idx =
+            (THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed) as usize) % URING_THREADS.len();
+
+        // Send to selected thread via channel
+        match URING_THREADS[thread_idx]
+            .request_tx
+            .send(Arc::clone(&request))
+        {
+            Ok(()) => {
+                // Return future that will be woken when operation completes
+                Box::pin(UringReadFuture { request })
+            }
+            Err(_) => {
+                // Thread died - decrement counter and return error future
+                SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    Err(object_store::Error::Generic {
+                        store: "UringReader",
+                        source: Box::new(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "io_uring thread died",
+                        )),
+                    })
                 })
-            });
+            }
         }
-
-        // 7. Return future that holds Arc clone
-        Box::pin(UringReadFuture {
-            request: future_request,
-        })
     }
 }
 

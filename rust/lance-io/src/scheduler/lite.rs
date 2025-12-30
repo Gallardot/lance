@@ -13,7 +13,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::task::noop_waker;
 use lance_core::{Error, Result};
 use snafu::location;
 
@@ -105,25 +104,12 @@ impl IoTask {
                 location: location!(),
             });
         };
-        let mut inner = run_fn();
-        // Poll task immediately to get it started
-        let noop_waker = noop_waker();
-        let mut dummy_cx = Context::from_waker(&noop_waker);
-        match inner.as_mut().poll(&mut dummy_cx) {
-            Poll::Ready(data) => {
-                self.state = TaskState::Finished {
-                    data,
-                    backpressure_reservation,
-                };
-            }
-            Poll::Pending => {
-                self.state = TaskState::Running {
-                    backpressure_reservation,
-                    inner,
-                    polled: false,
-                };
-            }
-        }
+        let inner = run_fn();
+        self.state = TaskState::Running {
+            backpressure_reservation,
+            inner,
+            polled: false,
+        };
         // If someone is already waiting for this task let them know it is now running
         // so they can poll it
         if let Some(idle_waker) = idle_waker {

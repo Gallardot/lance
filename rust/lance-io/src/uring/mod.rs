@@ -4,25 +4,27 @@
 //! io_uring-based I/O for high-performance local file access.
 //!
 //! This module provides a [`UringReader`] that implements the [`Reader`](crate::traits::Reader) trait
-//! using Linux's io_uring interface for asynchronous I/O. It uses a dedicated process-wide thread
-//! running a synchronous io_uring event loop, communicating via synchronous SPSC channels.
+//! using Linux's io_uring interface for asynchronous I/O. It uses a dedicated background thread
+//! that owns an io_uring instance and processes read requests from a channel.
 //!
 //! # Architecture
 //!
-//! - A static process-wide thread handles all io_uring operations
-//! - The thread is NOT managed by tokio and runs a synchronous event loop
-//! - Communication uses `std::sync::mpsc::sync_channel` for bounded SPSC queues
-//! - Futures on the reader side bridge sync responses to async API
+//! - A dedicated background thread owns a local io_uring instance
+//! - Readers submit requests via an MPSC channel to the thread
+//! - The thread submits requests to io_uring and processes completions
+//! - Futures are woken by the thread when operations complete
+//! - Proper async integration using wakers (no busy-looping)
 //!
 //! # Configuration
 //!
 //! The io_uring reader is enabled by using the `file+uring://` URI scheme instead of `file://`.
 //! Additional tuning parameters are controlled by environment variables:
 //!
-//! - `LANCE_URING_CORE` - CPU core to pin the uring thread to (optional)
 //! - `LANCE_URING_BLOCK_SIZE` - Block size in bytes (default: 64KB)
 //! - `LANCE_URING_IO_PARALLELISM` - Max concurrent operations (default: 32)
 //! - `LANCE_URING_QUEUE_DEPTH` - io_uring queue depth (default: 16K)
+//! - `LANCE_URING_CORE` - Pin io_uring thread to specific CPU core (optional)
+//! - `LANCE_URING_POLL_TIMEOUT_MS` - Thread poll timeout in milliseconds (default: 10)
 //!
 //! # Platform Support
 //!

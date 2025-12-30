@@ -45,7 +45,7 @@ static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
 //
 // Note: this only limits things that run through the scheduler.  It does not limit
 // IOPS from other sources like writing or commits.
-static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128;
+static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 16 * 1024;
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
