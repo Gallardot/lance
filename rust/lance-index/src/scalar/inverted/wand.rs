@@ -187,7 +187,7 @@ impl PostingIterator {
     }
 
     #[inline]
-    fn doc(&self) -> Option<DocInfo> {
+    pub(crate) fn doc(&self) -> Option<DocInfo> {
         if self.empty() {
             return None;
         }
@@ -230,7 +230,7 @@ impl PostingIterator {
     }
 
     // move to the next doc id that is greater than or equal to least_id
-    fn next(&mut self, least_id: u64) {
+    pub(crate) fn next(&mut self, least_id: u64) {
         match self.list {
             PostingList::Compressed(ref mut list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
@@ -299,6 +299,21 @@ impl PostingIterator {
                 Some(list.block_least_doc_id(self.block_idx + 1) as u64)
             }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index + 1).cloned(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clone_reset(&self) -> Self {
+        let is_compressed = matches!(self.list, PostingList::Compressed(_));
+        Self {
+            token: self.token.clone(),
+            token_id: self.token_id,
+            position: self.position,
+            list: self.list.clone(),
+            index: 0,
+            block_idx: 0,
+            approximate_upper_bound: self.approximate_upper_bound,
+            compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
         }
     }
 }
@@ -431,6 +446,92 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .collect())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn search_with<F>(
+        &mut self,
+        params: &FtsSearchParams,
+        mask: Arc<RowAddrMask>,
+        metrics: &dyn MetricsCollector,
+        mut eval: F,
+    ) -> Result<Vec<DocCandidate>>
+    where
+        F: FnMut(u64, u64, u32) -> Option<(f32, Vec<(u32, u32)>)>,
+    {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+
+        match (mask.max_len(), mask.iter_addrs()) {
+            (Some(num_rows_matched), Some(row_ids))
+                if num_rows_matched * 100
+                    <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
+            {
+                return self.flat_search_with(params, row_ids, metrics, &mut eval);
+            }
+            _ => {}
+        }
+
+        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut num_comparisons = 0;
+        while let Some((pivot, doc)) = self.next()? {
+            if let Some(cur_doc) = self.cur_doc {
+                if cur_doc.doc_id() >= doc.doc_id() {
+                    continue;
+                }
+            }
+            self.cur_doc = Some(doc);
+            num_comparisons += 1;
+
+            let row_id = match &doc {
+                DocInfo::Raw(doc) => self.docs.row_id(doc.doc_id),
+                DocInfo::Located(doc) => doc.row_id,
+            };
+            if !mask.selected(row_id) {
+                self.move_preceding(pivot, doc.doc_id() + 1);
+                continue;
+            }
+
+            if params.phrase_slop.is_some()
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+            {
+                self.move_preceding(pivot, doc.doc_id() + 1);
+                continue;
+            }
+
+            let doc_length = match &doc {
+                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
+            };
+            let Some((score, freqs)) = eval(doc.doc_id(), row_id, doc_length) else {
+                self.move_preceding(pivot, doc.doc_id() + 1);
+                continue;
+            };
+
+            if candidates.len() < limit {
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                if candidates.len() == limit {
+                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                }
+            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+                candidates.pop();
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+            }
+            self.move_preceding(pivot, doc.doc_id() + 1);
+        }
+        metrics.record_comparisons(num_comparisons);
+
+        Ok(candidates
+            .into_iter()
+            .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
+                row_id: doc.row_id,
+                freqs,
+                doc_length,
+            })
+            .collect())
+    }
+
     fn flat_search(
         &mut self,
         params: &FtsSearchParams,
@@ -532,6 +633,128 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let score = self.score(max_pivot, doc_length);
             let freqs = self.iter_term_freqs(max_pivot).collect();
+
+            if candidates.len() < limit {
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                if candidates.len() == limit {
+                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                }
+            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+                candidates.pop();
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+            }
+        }
+        metrics.record_comparisons(num_comparisons);
+
+        Ok(candidates
+            .into_iter()
+            .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
+                row_id: doc.row_id,
+                freqs,
+                doc_length,
+            })
+            .collect())
+    }
+
+    #[allow(dead_code)]
+    fn flat_search_with<F>(
+        &mut self,
+        params: &FtsSearchParams,
+        row_ids: Box<dyn Iterator<Item = RowAddress> + '_>,
+        metrics: &dyn MetricsCollector,
+        eval: &mut F,
+    ) -> Result<Vec<DocCandidate>>
+    where
+        F: FnMut(u64, u64, u32) -> Option<(f32, Vec<(u32, u32)>)>,
+    {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+
+        let doc_ids = row_ids
+            .filter_map(|row_addr| {
+                let row_id: u64 = row_addr.into();
+                self.docs.doc_id(row_id).map(|doc_id| (doc_id, row_id))
+            })
+            .sorted_unstable()
+            .collect::<Vec<_>>();
+        let is_compressed = matches!(self.postings[0].list, PostingList::Compressed(_));
+
+        let mut num_comparisons = 0;
+        let mut candidates = BinaryHeap::new();
+        let mut current_doc = 0;
+        for (doc_id, row_id) in doc_ids {
+            num_comparisons += 1;
+
+            if doc_id < current_doc {
+                continue;
+            }
+            current_doc = doc_id;
+
+            let mut pivot = 0;
+            let mut approximate_upper_bound = self.postings[0].approximate_upper_bound();
+            while pivot + 1 < self.postings.len() && approximate_upper_bound < self.threshold {
+                approximate_upper_bound += self.postings[pivot + 1].approximate_upper_bound();
+                pivot += 1;
+            }
+
+            if let Some(least_id) = self.postings[0].block_first_doc() {
+                if least_id > doc_id {
+                    current_doc = least_id;
+                    continue;
+                }
+            }
+            let mut max_pivot = 0;
+            while max_pivot + 1 < self.postings.len() {
+                self.postings[max_pivot + 1].shallow_next(doc_id);
+                match self.postings[max_pivot + 1].block_first_doc() {
+                    Some(block_doc_id) if block_doc_id <= doc_id => {
+                        max_pivot += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            if !self.check_block_max(max_pivot, doc_id) {
+                let (_, least_id) = self.get_new_candidate(max_pivot);
+                if least_id == TERMINATED_DOC_ID {
+                    break;
+                }
+                current_doc = std::cmp::max(doc_id, least_id);
+                self.move_preceding(max_pivot, least_id);
+                continue;
+            }
+
+            if !self.check_pivot_aligned(pivot, doc_id) {
+                if self.postings.is_empty() {
+                    break;
+                } else {
+                    continue;
+                }
+            }
+
+            max_pivot = 0;
+            while max_pivot + 1 < self.postings.len()
+                && self.postings[max_pivot + 1].doc().map(|d| d.doc_id()) == Some(doc_id)
+            {
+                max_pivot += 1;
+            }
+
+            if params.phrase_slop.is_some()
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+            {
+                continue;
+            }
+
+            let doc_length = match is_compressed {
+                true => self.docs.num_tokens(doc_id as u32),
+                false => self.docs.num_tokens_by_row_id(row_id),
+            };
+            let Some((score, freqs)) = eval(doc_id, row_id, doc_length) else {
+                continue;
+            };
 
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));

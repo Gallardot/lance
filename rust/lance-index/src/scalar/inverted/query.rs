@@ -635,8 +635,8 @@ impl BooleanQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BooleanMatchPlan {
     pub column: String,
     pub should: Vec<MatchQuery>,

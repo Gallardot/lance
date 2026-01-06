@@ -69,7 +69,7 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
-use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
+use crate::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, TextTokenizer};
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::{
@@ -123,6 +123,135 @@ impl PartitionCandidates {
             tokens_by_position: Vec::new(),
             candidates: Vec::new(),
         }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct BooleanPartitionCandidates {
+    tokens_by_position: Vec<String>,
+    term_boosts: Vec<f32>,
+    candidates: Vec<DocCandidate>,
+}
+
+impl BooleanPartitionCandidates {
+    fn empty() -> Self {
+        Self {
+            tokens_by_position: Vec::new(),
+            term_boosts: Vec::new(),
+            candidates: Vec::new(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct ClauseInput {
+    operator: Operator,
+    boost: f32,
+    tokens: Tokens,
+    params: FtsSearchParams,
+}
+
+#[allow(dead_code)]
+struct BooleanClause {
+    operator: Operator,
+    boost: f32,
+    term_offset: u32,
+    postings: Vec<PostingIterator>,
+}
+
+#[allow(dead_code)]
+impl BooleanClause {
+    fn eval<S: Scorer>(
+        &mut self,
+        doc_id: u64,
+        doc_length: u32,
+        scorer: &S,
+        freqs_out: &mut Vec<(u32, u32)>,
+    ) -> Option<f32> {
+        let mut clause_freqs = Vec::with_capacity(self.postings.len());
+        let mut score = 0.0;
+        let mut matched_terms = 0;
+        for posting in &mut self.postings {
+            posting.next(doc_id);
+            let doc = posting.doc();
+            if doc.as_ref().map(|doc| doc.doc_id()) == Some(doc_id) {
+                let freq = doc.expect("doc already checked").frequency();
+                matched_terms += 1;
+                clause_freqs.push((self.term_offset + posting.term_index(), freq));
+                score += scorer.score(posting.token(), freq, doc_length) * self.boost;
+            }
+        }
+
+        let matched = match self.operator {
+            Operator::And => matched_terms == self.postings.len(),
+            Operator::Or => matched_terms > 0,
+        };
+        if matched {
+            freqs_out.extend(clause_freqs);
+            Some(score)
+        } else {
+            None
+        }
+    }
+
+    fn matches(&mut self, doc_id: u64) -> bool {
+        let mut matched_terms = 0;
+        for posting in &mut self.postings {
+            posting.next(doc_id);
+            let doc = posting.doc();
+            if doc.as_ref().map(|doc| doc.doc_id()) == Some(doc_id) {
+                matched_terms += 1;
+            } else if self.operator == Operator::And {
+                return false;
+            }
+        }
+        match self.operator {
+            Operator::And => matched_terms == self.postings.len(),
+            Operator::Or => matched_terms > 0,
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct BooleanEval<S: Scorer> {
+    scorer: S,
+    must: Vec<BooleanClause>,
+    should: Vec<BooleanClause>,
+    must_not: Vec<BooleanClause>,
+}
+
+#[allow(dead_code)]
+impl<S: Scorer> BooleanEval<S> {
+    fn evaluate(&mut self, doc_id: u64, doc_length: u32) -> Option<(f32, Vec<(u32, u32)>)> {
+        for clause in &mut self.must_not {
+            if clause.matches(doc_id) {
+                return None;
+            }
+        }
+
+        let mut freqs = Vec::new();
+        let mut score = 0.0;
+        for clause in &mut self.must {
+            let clause_score = clause.eval(doc_id, doc_length, &self.scorer, &mut freqs)?;
+            score += clause_score;
+        }
+
+        let mut matched_should_any = false;
+        for clause in &mut self.should {
+            if let Some(clause_score) = clause.eval(doc_id, doc_length, &self.scorer, &mut freqs)
+            {
+                matched_should_any = true;
+                score += clause_score;
+            }
+        }
+
+        if self.must.is_empty() && !matched_should_any {
+            return None;
+        }
+
+        Some((score, freqs))
     }
 }
 
@@ -321,6 +450,216 @@ impl InvertedIndex {
                     debug_assert!((term_index as usize) < tokens_by_position.len());
                     let token = &tokens_by_position[term_index as usize];
                     score += scorer.score(token.as_str(), freq, doc_length);
+                }
+                if candidates.len() < limit {
+                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                } else if candidates.peek().unwrap().0.score.0 < score {
+                    candidates.pop();
+                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                }
+            }
+        }
+
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+            .unzip())
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    #[allow(dead_code)]
+    pub(crate) async fn bm25_search_boolean(
+        &self,
+        plan: &BooleanMatchPlan,
+        params: Arc<FtsSearchParams>,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mask = prefilter.mask();
+        let doc_type = self.tokenizer().doc_type().clone();
+
+        let build_clause_input = |query: &MatchQuery| {
+            let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
+            let mut tokenizer: Box<dyn LanceTokenizer> = if is_fuzzy {
+                let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
+                    tantivy::tokenizer::SimpleTokenizer::default(),
+                );
+                let doc_type = doc_type.clone();
+                match doc_type {
+                    DocType::Text => Box::new(TextTokenizer::new(tokenizer)) as _,
+                    DocType::Json => Box::new(JsonTokenizer::new(tokenizer)) as _,
+                }
+            } else {
+                self.tokenizer()
+            };
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
+            let params = FtsSearchParams::new()
+                .with_fuzziness(query.fuzziness)
+                .with_max_expansions(query.max_expansions)
+                .with_prefix_length(query.prefix_length);
+            ClauseInput {
+                operator: query.operator,
+                boost: query.boost,
+                tokens,
+                params,
+            }
+        };
+
+        let should_inputs = plan
+            .should
+            .iter()
+            .map(build_clause_input)
+            .collect::<Vec<_>>();
+        let must_inputs = plan
+            .must
+            .iter()
+            .map(build_clause_input)
+            .collect::<Vec<_>>();
+        let must_not_inputs = plan
+            .must_not
+            .iter()
+            .map(build_clause_input)
+            .collect::<Vec<_>>();
+
+        let parts = self
+            .partitions
+            .iter()
+            .map(|part| {
+                let part = part.clone();
+                let params = params.clone();
+                let mask = mask.clone();
+                let metrics = metrics.clone();
+                let should_inputs = should_inputs.clone();
+                let must_inputs = must_inputs.clone();
+                let must_not_inputs = must_not_inputs.clone();
+                async move {
+                    let mut tokens_by_position = Vec::new();
+                    let mut term_boosts = Vec::new();
+                    let mut wand_postings = Vec::new();
+                    let mut must_clauses = Vec::new();
+                    let mut should_clauses = Vec::new();
+                    let mut must_not_clauses = Vec::new();
+                    let mut term_offset = 0u32;
+
+                    for input in &must_inputs {
+                        let postings = part
+                            .load_posting_lists(&input.tokens, &input.params, metrics.as_ref())
+                            .await?;
+                        if postings.is_empty() {
+                            return Ok(BooleanPartitionCandidates::empty());
+                        }
+                        let offset = term_offset;
+                        term_offset += postings.len() as u32;
+                        for posting in &postings {
+                            tokens_by_position.push(posting.token().to_owned());
+                            term_boosts.push(input.boost);
+                        }
+                        wand_postings.extend(postings.iter().map(PostingIterator::clone_reset));
+                        must_clauses.push(BooleanClause {
+                            operator: input.operator,
+                            boost: input.boost,
+                            term_offset: offset,
+                            postings,
+                        });
+                    }
+
+                    for input in &should_inputs {
+                        let postings = part
+                            .load_posting_lists(&input.tokens, &input.params, metrics.as_ref())
+                            .await?;
+                        if postings.is_empty() {
+                            continue;
+                        }
+                        let offset = term_offset;
+                        term_offset += postings.len() as u32;
+                        for posting in &postings {
+                            tokens_by_position.push(posting.token().to_owned());
+                            term_boosts.push(input.boost);
+                        }
+                        wand_postings.extend(postings.iter().map(PostingIterator::clone_reset));
+                        should_clauses.push(BooleanClause {
+                            operator: input.operator,
+                            boost: input.boost,
+                            term_offset: offset,
+                            postings,
+                        });
+                    }
+
+                    for input in &must_not_inputs {
+                        let postings = part
+                            .load_posting_lists(&input.tokens, &input.params, metrics.as_ref())
+                            .await?;
+                        if postings.is_empty() {
+                            continue;
+                        }
+                        must_not_clauses.push(BooleanClause {
+                            operator: input.operator,
+                            boost: input.boost,
+                            term_offset: 0,
+                            postings,
+                        });
+                    }
+
+                    if wand_postings.is_empty() {
+                        return Ok(BooleanPartitionCandidates::empty());
+                    }
+
+                    spawn_cpu(move || {
+                        let scorer = IndexBM25Scorer::new(std::iter::once(part.as_ref()));
+                        let eval_scorer = IndexBM25Scorer::new(std::iter::once(part.as_ref()));
+                        let mut wand = Wand::new(
+                            Operator::Or,
+                            wand_postings.into_iter(),
+                            &part.docs,
+                            scorer,
+                        );
+                        let mut eval = BooleanEval {
+                            scorer: eval_scorer,
+                            must: must_clauses,
+                            should: should_clauses,
+                            must_not: must_not_clauses,
+                        };
+                        let candidates = wand.search_with(
+                            params.as_ref(),
+                            mask,
+                            metrics.as_ref(),
+                            |doc_id, _row_id, doc_length| eval.evaluate(doc_id, doc_length),
+                        )?;
+                        Ok(BooleanPartitionCandidates {
+                            tokens_by_position,
+                            term_boosts,
+                            candidates,
+                        })
+                    })
+                    .await
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let mut candidates = BinaryHeap::with_capacity(limit);
+        while let Some(res) = parts.try_next().await? {
+            if res.candidates.is_empty() {
+                continue;
+            }
+            for DocCandidate {
+                row_id,
+                freqs,
+                doc_length,
+            } in res.candidates
+            {
+                let mut score = 0.0;
+                for (term_index, freq) in freqs {
+                    let idx = term_index as usize;
+                    debug_assert!(idx < res.tokens_by_position.len());
+                    let token = &res.tokens_by_position[idx];
+                    score += scorer.score(token, freq, doc_length) * res.term_boosts[idx];
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -2763,5 +3102,280 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+    }
+
+    async fn build_simple_index() -> (Arc<InvertedIndex>, Vec<String>) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let docs = vec![
+            "apple banana".to_string(),
+            "apple".to_string(),
+            "banana carrot".to_string(),
+            "carrot".to_string(),
+            "apple banana carrot".to_string(),
+        ];
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("apple".to_string());
+        builder.tokens.add("banana".to_string());
+        builder.tokens.add("carrot".to_string());
+
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[0].add(1, PositionRecorder::Count(1));
+        builder.posting_lists[0].add(4, PositionRecorder::Count(1));
+
+        builder.posting_lists[1].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(2, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(4, PositionRecorder::Count(1));
+
+        builder.posting_lists[2].add(2, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(3, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(4, PositionRecorder::Count(1));
+
+        builder.docs.append(0, 2);
+        builder.docs.append(1, 1);
+        builder.docs.append(2, 2);
+        builder.docs.append(3, 1);
+        builder.docs.append(4, 3);
+
+        builder.write(store.as_ref()).await.unwrap();
+
+        let params = InvertedIndexParams {
+            stem: false,
+            remove_stop_words: false,
+            ..Default::default()
+        };
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&params).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        (index, docs)
+    }
+
+    fn brute_force_boolean(
+        index: &InvertedIndex,
+        docs: &[String],
+        must: &[MatchQuery],
+        should: &[MatchQuery],
+        must_not: &[MatchQuery],
+        limit: usize,
+    ) -> Vec<(u64, f32)> {
+        let scorer = IndexBM25Scorer::new(index.partitions.iter().map(|part| part.as_ref()));
+
+        let mut results = Vec::new();
+        for (row_id, doc) in docs.iter().enumerate() {
+            let mut tokenizer = index.tokenizer();
+            let doc_tokens = collect_doc_tokens(doc, &mut tokenizer, None);
+            let doc_length = doc_tokens.len() as u32;
+            let mut doc_counts = HashMap::new();
+            for token in &doc_tokens {
+                *doc_counts.entry(token.clone()).or_insert(0) += 1;
+            }
+
+            let mut clause_scores = 0.0;
+
+            let mut matches_must = true;
+            for query in must {
+                let mut tokenizer = index.tokenizer();
+                let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
+                if query_tokens.is_empty() {
+                    matches_must = false;
+                    break;
+                }
+                let mut matched_terms = 0;
+                let mut score = 0.0;
+                for token in &query_tokens {
+                    let freq = doc_counts.get(token).copied().unwrap_or(0);
+                    if freq > 0 {
+                        matched_terms += 1;
+                        score += scorer.score(token, freq, doc_length);
+                    }
+                }
+                let matched = match query.operator {
+                    Operator::And => matched_terms == query_tokens.len(),
+                    Operator::Or => matched_terms > 0,
+                };
+                if !matched {
+                    matches_must = false;
+                    break;
+                }
+                clause_scores += score * query.boost;
+            }
+            if !matches_must {
+                continue;
+            }
+
+            let mut blocked = false;
+            for query in must_not {
+                let mut tokenizer = index.tokenizer();
+                let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
+                if query_tokens.is_empty() {
+                    continue;
+                }
+                let mut matched_terms = 0;
+                for token in &query_tokens {
+                    let freq = doc_counts.get(token).copied().unwrap_or(0);
+                    if freq > 0 {
+                        matched_terms += 1;
+                    }
+                }
+                let matched = match query.operator {
+                    Operator::And => matched_terms == query_tokens.len(),
+                    Operator::Or => matched_terms > 0,
+                };
+                if matched {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                continue;
+            }
+
+            let mut matched_should_any = false;
+            for query in should {
+                let mut tokenizer = index.tokenizer();
+                let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
+                if query_tokens.is_empty() {
+                    continue;
+                }
+                let mut matched_terms = 0;
+                let mut score = 0.0;
+                for token in &query_tokens {
+                    let freq = doc_counts.get(token).copied().unwrap_or(0);
+                    if freq > 0 {
+                        matched_terms += 1;
+                        score += scorer.score(token, freq, doc_length);
+                    }
+                }
+                let matched = match query.operator {
+                    Operator::And => matched_terms == query_tokens.len(),
+                    Operator::Or => matched_terms > 0,
+                };
+                if matched {
+                    matched_should_any = true;
+                    clause_scores += score * query.boost;
+                }
+            }
+            if must.is_empty() && !matched_should_any {
+                continue;
+            }
+
+            results.push((row_id as u64, clause_scores));
+        }
+
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
+        results.truncate(limit);
+        results
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_boolean_must_and_should() {
+        let (index, docs) = build_simple_index().await;
+
+        let must = MatchQuery::new("apple banana".to_string())
+            .with_column(Some("text".to_string()))
+            .with_operator(Operator::And);
+        let should =
+            MatchQuery::new("carrot".to_string()).with_column(Some("text".to_string()));
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, must.clone().into()),
+            (Occur::Should, should.clone().into()),
+        ]);
+        let plan = BooleanMatchPlan::try_build(&FtsQuery::Boolean(query)).unwrap();
+
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search_boolean(&plan, params, prefilter, metrics)
+            .await
+            .unwrap();
+
+        let expected =
+            brute_force_boolean(&index, &docs, &[must], &[should], &[], 10);
+        let expected_ids = expected.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let expected_scores = expected.iter().map(|(_, score)| *score).collect::<Vec<_>>();
+
+        assert_eq!(row_ids, expected_ids);
+        for (actual, expected) in scores.iter().zip(expected_scores.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_boolean_should_with_must_not() {
+        let (index, docs) = build_simple_index().await;
+
+        let should_apple =
+            MatchQuery::new("apple".to_string()).with_column(Some("text".to_string()));
+        let should_banana =
+            MatchQuery::new("banana".to_string()).with_column(Some("text".to_string()));
+        let must_not =
+            MatchQuery::new("carrot".to_string()).with_column(Some("text".to_string()));
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Should, should_apple.clone().into()),
+            (Occur::Should, should_banana.clone().into()),
+            (Occur::MustNot, must_not.clone().into()),
+        ]);
+        let plan = BooleanMatchPlan::try_build(&FtsQuery::Boolean(query)).unwrap();
+
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search_boolean(&plan, params, prefilter, metrics)
+            .await
+            .unwrap();
+
+        let expected = brute_force_boolean(
+            &index,
+            &docs,
+            &[],
+            &[should_apple, should_banana],
+            &[must_not],
+            10,
+        );
+        let expected_ids = expected.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let expected_scores = expected.iter().map(|(_, score)| *score).collect::<Vec<_>>();
+
+        assert_eq!(row_ids, expected_ids);
+        for (actual, expected) in scores.iter().zip(expected_scores.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 }
