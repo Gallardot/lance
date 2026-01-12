@@ -60,6 +60,38 @@ pub fn l2_distance_int_scalar(key: &[i8], target: &[i8]) -> f32 {
         .sum::<i32>() as f32
 }
 
+/// Calculate L2 distance between two int8 slices.
+///
+/// This is optimized for auto-vectorization.
+#[inline]
+pub fn l2_distance_int_scalar_auto_vectorized(key: &[i8], target: &[i8]) -> f32 {
+    const LANES: usize = 16;
+    let x_chunks = key.chunks_exact(LANES);
+    let y_chunks = target.chunks_exact(LANES);
+
+    let x_reminder = x_chunks.remainder();
+    let y_reminder = y_chunks.remainder();
+
+    let mut sums = [0i32; LANES];
+    for (x, y) in x_chunks.zip(y_chunks) {
+        for i in 0..LANES {
+            let diff = x[i] as i32 - y[i] as i32;
+            sums[i] += diff * diff;
+        }
+    }
+
+    let mut sum = sums.iter().copied().sum::<i32>();
+    sum += x_reminder
+        .iter()
+        .zip(y_reminder)
+        .map(|(&x, &y)| {
+            let diff = x as i32 - y as i32;
+            diff * diff
+        })
+        .sum::<i32>();
+    sum as f32
+}
+
 /// Calculate the L2 distance between two vectors, using scalar operations.
 ///
 /// It relies on LLVM for auto-vectorization and unrolling.
@@ -348,6 +380,15 @@ mod tests {
         let target = [127_i8, 0, -128];
         let dist = l2_distance_int_scalar(&key, &target);
         assert_eq!(dist, 130050.0);
+    }
+
+    #[test]
+    fn test_l2_distance_int8_scalar_auto_vectorized() {
+        let key = (-8..9).map(|v| v as i8).collect::<Vec<_>>();
+        let target = (0..17).map(|v| v as i8).collect::<Vec<_>>();
+        let scalar = l2_distance_int_scalar(&key, &target);
+        let vectorized = l2_distance_int_scalar_auto_vectorized(&key, &target);
+        assert_eq!(scalar, vectorized);
     }
 
     #[test]

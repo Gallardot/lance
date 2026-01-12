@@ -16,7 +16,8 @@ use pprof::criterion::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_linalg::distance::{
-    l2::l2, l2_distance_batch, l2_distance_int_scalar, l2_distance_uint_scalar, L2,
+    l2::l2, l2_distance_batch, l2_distance_int_scalar, l2_distance_int_scalar_auto_vectorized,
+    l2_distance_uint_scalar, L2,
 };
 use lance_testing::datagen::generate_random_array_with_seed;
 
@@ -176,6 +177,17 @@ fn bench_int_distance(c: &mut Criterion) {
                 target
                     .chunks_exact(DIMENSION)
                     .map(|tgt| l2_distance_int_scalar(&key, tgt))
+                    .fold(0.0, |acc, v| acc + v),
+            );
+        });
+    });
+
+    c.bench_function("L2(int8, auto-vectorization)", |b| {
+        b.iter(|| {
+            black_box(
+                target
+                    .chunks_exact(DIMENSION)
+                    .map(|tgt| l2_distance_int_scalar_auto_vectorized(&key, tgt))
                     .fold(0.0, |acc, v| acc + v),
             );
         });
