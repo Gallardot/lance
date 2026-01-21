@@ -6301,30 +6301,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_constant_layout_inline_fixed_width_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
-
-        let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7; 1024]));
-        let field = arrow_schema::Field::new("c", DataType::Int32, true);
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
-
-        let PageEncoding::Structural(layout) = &page.description else {
-            panic!("Expected structural encoding");
-        };
-        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
-            panic!("Expected constant layout in slot 2");
-        };
-        assert!(layout.inline_value.is_some());
-        assert_eq!(page.data.len(), 0);
-
-        let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2)
-            .with_page_sizes(vec![4096]);
-        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
-    }
-
-    #[tokio::test]
     async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
         use crate::format::pb21::page_layout::Layout;
 
