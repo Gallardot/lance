@@ -1078,6 +1078,14 @@ impl LanceNamespace for ManifestNamespace {
         let object_id = Self::str_object_id(table_id);
         let table_info = self.query_manifest_for_table(&object_id).await?;
 
+        // Extract table name and namespace from table_id
+        let table_name = table_id.last().cloned().unwrap_or_default();
+        let namespace_id: Vec<String> = if table_id.len() > 1 {
+            table_id[..table_id.len() - 1].to_vec()
+        } else {
+            vec![]
+        };
+
         match table_info {
             Some(info) => {
                 // Construct full URI from relative location
@@ -1097,21 +1105,27 @@ impl LanceNamespace for ManifestNamespace {
                         let json_schema = arrow_schema_to_json(&arrow_schema)?;
 
                         Ok(DescribeTableResponse {
+                            table: Some(table_name.clone()),
+                            namespace: Some(namespace_id.clone()),
                             version: Some(version as i64),
-                            location: Some(table_uri),
+                            location: Some(table_uri.clone()),
+                            table_uri: Some(table_uri),
                             schema: Some(Box::new(json_schema)),
-                            properties: None,
                             storage_options: self.storage_options.clone(),
+                            stats: None,
                         })
                     }
                     Err(_) => {
                         // If dataset can't be opened (e.g., empty table), return minimal info
                         Ok(DescribeTableResponse {
+                            table: Some(table_name),
+                            namespace: Some(namespace_id),
                             version: None,
-                            location: Some(table_uri),
+                            location: Some(table_uri.clone()),
+                            table_uri: Some(table_uri),
                             schema: None,
-                            properties: None,
                             storage_options: self.storage_options.clone(),
+                            stats: None,
                         })
                     }
                 }
@@ -1197,21 +1211,6 @@ impl LanceNamespace for ManifestNamespace {
             });
         }
 
-        // Validate location if provided
-        if let Some(location) = &request.location {
-            let location = location.trim_end_matches('/');
-            if location != table_uri {
-                return Err(Error::Namespace {
-                    source: format!(
-                        "Cannot create table {} at location {}, must be at location {}",
-                        table_name, location, table_uri
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
-        }
-
         // Write the data using Lance Dataset
         let cursor = Cursor::new(data.to_vec());
         let stream_reader = StreamReader::try_new(cursor, None)
@@ -1250,9 +1249,9 @@ impl LanceNamespace for ManifestNamespace {
             .await?;
 
         Ok(CreateTableResponse {
+            transaction_id: None,
             version: Some(1),
             location: Some(table_uri),
-            properties: None,
             storage_options: self.storage_options.clone(),
         })
     }
@@ -1440,6 +1439,7 @@ impl LanceNamespace for ManifestNamespace {
         .await?;
 
         Ok(CreateNamespaceResponse {
+            transaction_id: None,
             properties: request.properties,
         })
     }
@@ -1622,6 +1622,7 @@ impl LanceNamespace for ManifestNamespace {
         );
 
         Ok(CreateEmptyTableResponse {
+            transaction_id: None,
             location: Some(table_uri),
             properties: None,
             storage_options: self.storage_options.clone(),
@@ -1697,7 +1698,8 @@ impl LanceNamespace for ManifestNamespace {
             .await?;
 
         Ok(RegisterTableResponse {
-            location,
+            transaction_id: None,
+            location: Some(location),
             properties: None,
         })
     }
@@ -1739,6 +1741,7 @@ impl LanceNamespace for ManifestNamespace {
         };
 
         Ok(DeregisterTableResponse {
+            transaction_id: None,
             id: request.id.clone(),
             location: Some(table_uri),
             properties: None,
