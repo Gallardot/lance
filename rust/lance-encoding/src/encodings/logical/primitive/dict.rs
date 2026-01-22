@@ -121,6 +121,8 @@ where
     T: ArrowNativeType,
     usize: TryFrom<T>,
 {
+    use std::collections::hash_map::Entry;
+
     let mut map = HashMap::new();
     let offsets = variable_width_data_block
         .offsets
@@ -132,42 +134,72 @@ where
         .expect("VariableWidth DataBlock should have valid `Stat::MaxLength` statistics");
     let max_len = max_len.as_primitive::<UInt64Type>().value(0);
 
-    let mut dictionary_buffer: Vec<u8> = Vec::with_capacity((max_len * cardinality) as usize);
+    let max_dict_data_len = variable_width_data_block.data.len();
+    let expected_dict_data_len = max_len
+        .checked_mul(cardinality)
+        .and_then(|v| <usize as std::convert::TryFrom<u64>>::try_from(v).ok());
+    let dict_data_capacity = expected_dict_data_len
+        .map(|len| len.min(max_dict_data_len))
+        .unwrap_or(max_dict_data_len);
+
+    let mut dictionary_buffer: Vec<u8> = Vec::with_capacity(dict_data_capacity);
     let mut dictionary_offsets_buffer = vec![T::default()];
     let mut curr_idx = 0;
     let mut indices_buffer = Vec::with_capacity(variable_width_data_block.num_values as usize);
+    let original_size = variable_width_data_block
+        .data_size()
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let bytes_per_offset = (bits_per_offset / 8) as usize;
 
     for window in offsets.windows(2) {
-        let start = usize::try_from(window[0]).ok().unwrap();
-        let end = usize::try_from(window[1]).ok().unwrap();
+        let start = usize::try_from(window[0]).ok()?;
+        let end = usize::try_from(window[1]).ok()?;
+        if start > end || end > variable_width_data_block.data.len() {
+            return None;
+        }
 
         let key = &variable_width_data_block.data[start..end];
 
-        let idx: i32 = *map.entry(U8SliceKey(key)).or_insert_with(|| {
-            dictionary_buffer.extend_from_slice(key);
-            dictionary_offsets_buffer.push(T::from_usize(dictionary_buffer.len()).unwrap());
-            curr_idx += 1;
-            curr_idx - 1
-        });
+        let idx = match map.entry(U8SliceKey(key)) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                if curr_idx == i32::MAX {
+                    return None;
+                }
+                dictionary_buffer.extend_from_slice(key);
+                let dict_offset = T::from_usize(dictionary_buffer.len())?;
+                dictionary_offsets_buffer.push(dict_offset);
+                let idx = curr_idx;
+                entry.insert(idx);
+                curr_idx += 1;
+                idx
+            }
+        };
 
         indices_buffer.push(idx);
 
-        if dictionary_buffer.len()
-            + indices_buffer.len() * 32 / 8
-            + dictionary_offsets_buffer.len() * (bits_per_offset / 8) as usize
-            > variable_width_data_block.data_size() as usize
-        {
+        let indices_bytes = indices_buffer
+            .len()
+            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+        let offsets_bytes = dictionary_offsets_buffer.len().saturating_mul(bytes_per_offset);
+        let encoded_size = dictionary_buffer
+            .len()
+            .saturating_add(indices_bytes)
+            .saturating_add(offsets_bytes);
+        if encoded_size > original_size {
             return None;
         }
     }
 
-    let dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
+    let mut dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
         data: LanceBuffer::reinterpret_vec(dictionary_buffer),
         offsets: LanceBuffer::reinterpret_vec(dictionary_offsets_buffer),
         bits_per_offset,
         num_values: curr_idx as u64,
         block_info: BlockInfo::default(),
     });
+    dictionary_data_block.compute_stat();
 
     let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
         data: LanceBuffer::reinterpret_vec(indices_buffer),
@@ -191,9 +223,11 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
         .unwrap()
         .as_primitive::<UInt64Type>()
         .value(0);
-    let data_block_size = data_block.data_size() as usize;
+    let data_block_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
     match data_block {
         DataBlock::FixedWidth(ref mut fixed_width_data_block) => {
+            use std::collections::hash_map::Entry;
+
             let bytes_per_value = match fixed_width_data_block.bits_per_value {
                 64 => 8usize,
                 128 => 16usize,
@@ -211,16 +245,26 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                     let mut curr_idx: i32 = 0;
 
                     for &value in u64_slice.iter() {
-                        let idx = *map.entry(value).or_insert_with(|| {
-                            dictionary_buffer.push(value);
-                            curr_idx += 1;
-                            curr_idx - 1
-                        });
+                        let idx = match map.entry(value) {
+                            Entry::Occupied(entry) => *entry.get(),
+                            Entry::Vacant(entry) => {
+                                if curr_idx == i32::MAX {
+                                    return None;
+                                }
+                                dictionary_buffer.push(value);
+                                let idx = curr_idx;
+                                entry.insert(idx);
+                                curr_idx += 1;
+                                idx
+                            }
+                        };
                         indices_buffer.push(idx);
-                        if dictionary_buffer.len() * bytes_per_value
-                            + indices_buffer.len() * (DICT_INDICES_BITS_PER_VALUE as usize / 8)
-                            > data_block_size
-                        {
+                        let dict_bytes = dictionary_buffer.len().saturating_mul(bytes_per_value);
+                        let indices_bytes = indices_buffer
+                            .len()
+                            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+                        let encoded_size = dict_bytes.saturating_add(indices_bytes);
+                        if encoded_size > data_block_size {
                             return None;
                         }
                     }
@@ -253,16 +297,26 @@ pub fn dictionary_encode(mut data_block: DataBlock) -> Option<(DataBlock, DataBl
                     let mut curr_idx: i32 = 0;
 
                     for &value in u128_slice.iter() {
-                        let idx = *map.entry(value).or_insert_with(|| {
-                            dictionary_buffer.push(value);
-                            curr_idx += 1;
-                            curr_idx - 1
-                        });
+                        let idx = match map.entry(value) {
+                            Entry::Occupied(entry) => *entry.get(),
+                            Entry::Vacant(entry) => {
+                                if curr_idx == i32::MAX {
+                                    return None;
+                                }
+                                dictionary_buffer.push(value);
+                                let idx = curr_idx;
+                                entry.insert(idx);
+                                curr_idx += 1;
+                                idx
+                            }
+                        };
                         indices_buffer.push(idx);
-                        if dictionary_buffer.len() * bytes_per_value
-                            + indices_buffer.len() * (DICT_INDICES_BITS_PER_VALUE as usize / 8)
-                            > data_block_size
-                        {
+                        let dict_bytes = dictionary_buffer.len().saturating_mul(bytes_per_value);
+                        let indices_bytes = indices_buffer
+                            .len()
+                            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+                        let encoded_size = dict_bytes.saturating_add(indices_bytes);
+                        if encoded_size > data_block_size {
                             return None;
                         }
                     }
@@ -446,5 +500,19 @@ mod tests {
                 panic!("Expected VariableWidth dictionary block");
             }
         }
+    }
+
+    #[test]
+    fn test_dictionary_encode_invalid_offset_width_returns_none() {
+        let array = StringArray::from(vec!["a", "b", "c", "a"]);
+        let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
+        let invalid_block = match data_block {
+            DataBlock::VariableWidth(mut var) => {
+                var.bits_per_offset = 16;
+                DataBlock::VariableWidth(var)
+            }
+            other => panic!("Expected VariableWidth data block, got {:?}", other),
+        };
+        assert!(dictionary_encode(invalid_block).is_none());
     }
 }
