@@ -10,6 +10,7 @@ import json
 import math
 import re
 import struct
+import sys
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -752,6 +753,26 @@ class VectorStats:
     lengths_summary: Dict[str, Optional[float]]
 
 
+class ProgressReporter:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def info(self, message: str) -> None:
+        if self.enabled:
+            print(message, file=sys.stderr, flush=True)
+
+    def partition_start(self, index: int, total: int, partition_id: int) -> None:
+        self.info(f"[{index}/{total}] partition {partition_id}: loading")
+
+    def partition_done(
+        self, index: int, total: int, partition_id: int, docs: int, terms: int
+    ) -> None:
+        self.info(
+            f"[{index}/{total}] partition {partition_id}: done "
+            f"(docs={docs}, terms={terms})"
+        )
+
+
 def _is_object_uri(path: str) -> bool:
     parsed = urlparse(path)
     return bool(parsed.scheme and parsed.scheme != "file")
@@ -818,7 +839,7 @@ def _discover_partitions(session: LanceFileSession) -> Tuple[List[int], Optional
     return partitions, token_format, partitioned
 
 
-def analyze_vector(index_path: Union[str, Path]) -> VectorStats:
+def analyze_vector(index_path: Union[str, Path], progress: bool = False) -> VectorStats:
     index_path_str = str(index_path)
     if not index_path_str.endswith("index.idx"):
         if _is_object_uri(index_path_str):
@@ -827,6 +848,8 @@ def analyze_vector(index_path: Union[str, Path]) -> VectorStats:
             local_path = Path(index_path_str)
             if local_path.is_dir():
                 index_path_str = str(local_path / "index.idx")
+    reporter = ProgressReporter(progress)
+    reporter.info(f"Reading vector index metadata: {index_path_str}")
     reader = LanceFileReader(index_path_str)
     metadata = _normalize_metadata(reader.metadata().schema.metadata)
     if "lance:ivf" not in metadata:
@@ -835,6 +858,7 @@ def analyze_vector(index_path: Union[str, Path]) -> VectorStats:
     ivf_bytes = reader.read_global_buffer(ivf_buffer_index)
     parsed = parse_ivf_proto(ivf_bytes)
     lengths = [int(v) for v in parsed["lengths"]]
+    reporter.info(f"Vector partitions: {len(lengths)}")
     return VectorStats(
         partitions=len(lengths),
         lengths=lengths,
@@ -847,9 +871,12 @@ def analyze_fts(
     compare: Optional[Tuple[int, int]] = None,
     include_term_lengths: bool = False,
     compute_union: bool = True,
+    progress: bool = False,
 ) -> Dict[str, object]:
     session = _make_session(index_dir)
     partitions, token_format, partitioned = _discover_partitions(session)
+    reporter = ProgressReporter(progress)
+    reporter.info(f"Scanning FTS index with {len(partitions)} partitions")
     stats: List[PartitionStats] = []
     sizes: List[int] = []
     bytes_totals: List[int] = []
@@ -857,7 +884,8 @@ def analyze_fts(
 
     compare_ids = set(compare) if compare else set()
 
-    for part_id in partitions:
+    for idx, part_id in enumerate(partitions, start=1):
+        reporter.partition_start(idx, len(partitions), part_id)
         file_paths = _partition_file_paths(part_id if partitioned else None, partitioned)
         docs_reader = session.open_reader(file_paths["docs"])
         docs_count = int(docs_reader.metadata().num_rows)
@@ -901,6 +929,7 @@ def analyze_fts(
                 term_lengths=term_lengths,
             )
         )
+        reporter.partition_done(idx, len(partitions), part_id, docs_count, tokens.count)
 
     compare_stats = None
     if compare:
@@ -999,6 +1028,12 @@ def _parse_args_from_list(argv: Optional[Sequence[str]] = None) -> argparse.Name
     )
     vector_parser.add_argument("--format", choices=["text", "json"], default="text")
     vector_parser.add_argument("--verbose", action="store_true")
+    vector_parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show progress updates",
+    )
 
     fts_parser = subparsers.add_parser("fts", help="Analyze FTS index")
     fts_parser.add_argument(
@@ -1008,6 +1043,12 @@ def _parse_args_from_list(argv: Optional[Sequence[str]] = None) -> argparse.Name
     )
     fts_parser.add_argument("--format", choices=["text", "json"], default="text")
     fts_parser.add_argument("--verbose", action="store_true")
+    fts_parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show progress updates",
+    )
     fts_parser.add_argument(
         "--compare",
         nargs=2,
@@ -1035,7 +1076,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     if args.command == "vector":
-        stats = analyze_vector(args.path)
+        stats = analyze_vector(args.path, progress=args.progress)
         if args.format == "json":
             print(json.dumps(stats.__dict__, indent=2))
         else:
@@ -1049,6 +1090,7 @@ def main() -> None:
         compare=compare,
         include_term_lengths=include_term_lengths,
         compute_union=not args.skip_union,
+        progress=args.progress,
     )
 
     if include_term_lengths and args.terms_out is not None:

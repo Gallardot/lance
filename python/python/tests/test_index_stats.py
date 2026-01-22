@@ -192,3 +192,11 @@ def test_parse_args_preserves_object_uri() -> None:
     uri = "gs://bucket/path/index_dir"
     args = _parse_args_from_list(["fts", uri])
     assert args.path == uri
+
+
+def test_parse_args_progress_flag() -> None:
+    uri = "gs://bucket/path/index_dir"
+    args = _parse_args_from_list(["fts", uri])
+    assert args.progress is True
+    args = _parse_args_from_list(["fts", uri, "--no-progress"])
+    assert args.progress is False
