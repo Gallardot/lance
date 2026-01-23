@@ -101,6 +101,13 @@ pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
 
+const POSTING_LIST_EST_BYTES_PER_ENTRY: u64 = 8;
+// Default segment size is 32 MiB. Use a tiny size for tests to avoid large inputs.
+#[cfg(test)]
+const SEGMENT_SIZE_BYTES: u64 = 64;
+#[cfg(not(test))]
+const SEGMENT_SIZE_BYTES: u64 = 32 * 1024 * 1024;
+
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
 pub static FTS_SCHEMA: LazyLock<SchemaRef> =
@@ -1214,6 +1221,23 @@ impl TokenSet {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PostingListSegmentMeta {
+    row_start: usize,
+    row_end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PostingListSegment {
+    batch: RecordBatch,
+}
+
+impl DeepSizeOf for PostingListSegment {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        self.batch.get_array_memory_size()
+    }
+}
+
 pub struct PostingListReader {
     reader: Arc<dyn IndexReader>,
 
@@ -1226,6 +1250,11 @@ pub struct PostingListReader {
 
     // new format only
     lengths: Option<Vec<u32>>,
+
+    // segment metadata for grouped IO
+    segments: Vec<PostingListSegmentMeta>,
+    // prefix sum of tokens per segment (segment end token index, exclusive)
+    segment_token_offsets: Vec<u32>,
 
     has_position: bool,
 
@@ -1246,6 +1275,8 @@ impl DeepSizeOf for PostingListReader {
         self.offsets.deep_size_of_children(context)
             + self.max_scores.deep_size_of_children(context)
             + self.lengths.deep_size_of_children(context)
+            + self.segment_token_offsets.len() * std::mem::size_of::<u32>()
+            + self.segments.len() * std::mem::size_of::<PostingListSegmentMeta>()
     }
 }
 
@@ -1272,12 +1303,31 @@ impl PostingListReader {
                 .to_vec();
             (None, Some(max_scores), Some(lengths))
         };
+        let posting_lengths = match &lengths {
+            Some(lengths) => lengths.clone(),
+            None => {
+                let offsets = offsets.as_ref().ok_or(Error::Index {
+                    message: "offsets not found for legacy posting list reader".to_owned(),
+                    location: location!(),
+                })?;
+                let mut lengths = Vec::with_capacity(offsets.len());
+                for (idx, offset) in offsets.iter().enumerate() {
+                    let next_offset = offsets.get(idx + 1).copied().unwrap_or(reader.num_rows());
+                    lengths.push((next_offset - *offset) as u32);
+                }
+                lengths
+            }
+        };
+        let (segments, segment_token_offsets) =
+            Self::build_segments(&posting_lengths, offsets.as_ref(), reader.num_rows());
 
         Ok(Self {
             reader,
             offsets,
             max_scores,
             lengths,
+            segments,
+            segment_token_offsets,
             has_position,
             index_cache: WeakLanceCache::from(index_cache),
         })
@@ -1300,6 +1350,77 @@ impl PostingListReader {
             .map(|max_scores| serde_json::from_str(max_scores))
             .transpose()?;
         Ok((offsets, max_scores))
+    }
+
+    fn build_segments(
+        posting_lengths: &[u32],
+        offsets: Option<&Vec<usize>>,
+        num_rows: usize,
+    ) -> (Vec<PostingListSegmentMeta>, Vec<u32>) {
+        let num_tokens = posting_lengths.len();
+        let mut segments = Vec::new();
+        let mut segment_token_offsets = Vec::new();
+
+        if num_tokens == 0 {
+            return (segments, segment_token_offsets);
+        }
+
+        let mut segment_start = 0usize;
+        let mut size_acc: u64 = 0;
+
+        for (token_idx, &length) in posting_lengths.iter().enumerate() {
+            size_acc = size_acc.saturating_add(length as u64 * POSTING_LIST_EST_BYTES_PER_ENTRY);
+            if size_acc >= SEGMENT_SIZE_BYTES {
+                let segment_end = token_idx + 1;
+                segments.push(Self::make_segment(
+                    segment_start,
+                    segment_end,
+                    offsets,
+                    num_rows,
+                ));
+                segment_token_offsets.push(segment_end as u32);
+                segment_start = segment_end;
+                size_acc = 0;
+            }
+        }
+
+        if segment_start < num_tokens {
+            segments.push(Self::make_segment(
+                segment_start,
+                num_tokens,
+                offsets,
+                num_rows,
+            ));
+            segment_token_offsets.push(num_tokens as u32);
+        }
+
+        (segments, segment_token_offsets)
+    }
+
+    fn make_segment(
+        segment_start: usize,
+        segment_end: usize,
+        offsets: Option<&Vec<usize>>,
+        num_rows: usize,
+    ) -> PostingListSegmentMeta {
+        let row_start = match offsets {
+            Some(offsets) => offsets[segment_start],
+            None => segment_start,
+        };
+        let row_end = match offsets {
+            Some(offsets) => offsets.get(segment_end).copied().unwrap_or(num_rows),
+            None => segment_end,
+        };
+
+        PostingListSegmentMeta { row_start, row_end }
+    }
+
+    fn segment_id(&self, token_id: u32) -> usize {
+        let segment_id = self
+            .segment_token_offsets
+            .partition_point(|&end| end <= token_id);
+        debug_assert!(segment_id < self.segments.len());
+        segment_id
     }
 
     // the number of posting lists
@@ -1339,44 +1460,12 @@ impl PostingListReader {
         }
     }
 
-    pub(crate) async fn posting_batch(
-        &self,
-        token_id: u32,
-        with_position: bool,
-    ) -> Result<RecordBatch> {
-        if self.offsets.is_some() {
-            self.posting_batch_legacy(token_id, with_position).await
-        } else {
-            let token_id = token_id as usize;
-            let columns = if with_position {
-                vec![POSTING_COL, POSITION_COL]
-            } else {
-                vec![POSTING_COL]
-            };
-            let batch = self
-                .reader
-                .read_range(token_id..token_id + 1, Some(&columns))
-                .await?;
-            Ok(batch)
-        }
-    }
-
-    async fn posting_batch_legacy(
-        &self,
-        token_id: u32,
-        with_position: bool,
-    ) -> Result<RecordBatch> {
-        let mut columns = vec![ROW_ID, FREQUENCY_COL];
-        if with_position {
-            columns.push(POSITION_COL);
-        }
-
-        let length = self.posting_len(token_id);
-        let token_id = token_id as usize;
-        let offset = self.offsets.as_ref().unwrap()[token_id];
+    async fn read_segment(&self, segment_id: usize, with_position: bool) -> Result<RecordBatch> {
+        let segment = &self.segments[segment_id];
+        let columns = self.posting_columns(with_position);
         let batch = self
             .reader
-            .read_range(offset..offset + length, Some(&columns))
+            .read_range(segment.row_start..segment.row_end, Some(&columns))
             .await?;
         Ok(batch)
     }
@@ -1388,18 +1477,33 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
-        let cache_key = PostingListKey { token_id };
-        let mut posting = self
+        let segment_id = self.segment_id(token_id);
+        let segment = self
             .index_cache
-            .get_or_insert_with_key(cache_key, || async move {
-                metrics.record_part_load();
-                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-                let batch = self.posting_batch(token_id, false).await?;
-                self.posting_list_from_batch(&batch, token_id)
-            })
-            .await?
-            .as_ref()
-            .clone();
+            .get_or_insert_with_key(
+                PostingListSegmentKey {
+                    segment_id: segment_id as u32,
+                },
+                || async move {
+                    metrics.record_part_load();
+                    info!(
+                        target: TRACE_IO_EVENTS,
+                        r#type = IO_TYPE_LOAD_SCALAR_PART,
+                        index_type = "inverted",
+                        part_id = token_id,
+                        segment_id = segment_id
+                    );
+                    let batch = self.read_segment(segment_id, false).await?;
+                    Ok(PostingListSegment { batch })
+                },
+            )
+            .await?;
+        let segment_meta = &self.segments[segment_id];
+        let posting_range = self.posting_list_range(token_id);
+        let local_start = posting_range.start - segment_meta.row_start;
+        let local_len = posting_range.end - posting_range.start;
+        let batch = segment.batch.slice(local_start, local_len);
+        let mut posting = self.posting_list_from_batch(&batch, token_id)?;
 
         if is_phrase_query {
             // hit the cache and when the cache was populated, the positions column was not loaded
@@ -1428,21 +1532,18 @@ impl PostingListReader {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let batch = self.read_batch(false).await?;
-        for token_id in 0..self.len() {
-            let posting_range = self.posting_list_range(token_id as u32);
-            let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
+        for segment_id in 0..self.segments.len() {
+            let batch = self.read_segment(segment_id, false).await?;
             // Apply shrink_to_fit to create a deep copy with compacted buffers
             // This ensures each cached entry has its own memory, not shared references
             let batch = batch.shrink_to_fit()?;
-            let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
             let inserted = self
                 .index_cache
                 .insert_with_key(
-                    &PostingListKey {
-                        token_id: token_id as u32,
+                    &PostingListSegmentKey {
+                        segment_id: segment_id as u32,
                     },
-                    Arc::new(posting_list),
+                    Arc::new(PostingListSegment { batch }),
                 )
                 .await;
 
@@ -1539,15 +1640,15 @@ impl DeepSizeOf for Positions {
 
 // Cache key implementations for type-safe cache access
 #[derive(Debug, Clone)]
-pub struct PostingListKey {
-    pub token_id: u32,
+struct PostingListSegmentKey {
+    pub segment_id: u32,
 }
 
-impl CacheKey for PostingListKey {
-    type ValueType = PostingList;
+impl CacheKey for PostingListSegmentKey {
+    type ValueType = PostingListSegment;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        format!("postings-{}", self.token_id).into()
+        format!("posting-segment-{}", self.segment_id).into()
     }
 }
 
@@ -2559,6 +2660,7 @@ mod tests {
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
@@ -2568,6 +2670,45 @@ mod tests {
     use crate::scalar::lance_format::LanceIndexStore;
 
     use super::*;
+
+    struct CountingIndexReader {
+        inner: Arc<dyn IndexReader>,
+        read_ranges: Arc<AtomicUsize>,
+    }
+
+    impl CountingIndexReader {
+        fn new(inner: Arc<dyn IndexReader>, read_ranges: Arc<AtomicUsize>) -> Self {
+            Self { inner, read_ranges }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IndexReader for CountingIndexReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            self.inner.read_record_batch(n, batch_size).await
+        }
+
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            self.read_ranges.fetch_add(1, Ordering::SeqCst);
+            self.inner.read_range(range, projection).await
+        }
+
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.inner.schema()
+        }
+    }
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
@@ -2784,6 +2925,71 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+    }
+
+    #[tokio::test]
+    async fn test_posting_list_segment_cache_reuses_io() -> Result<()> {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("token0".to_owned());
+        builder.tokens.add("token1".to_owned());
+        builder.tokens.add("token2".to_owned());
+        builder
+            .posting_lists
+            .resize_with(builder.tokens.len(), || PostingListBuilder::new(false));
+
+        let mut doc_ids = Vec::new();
+        for row_id in 0..12_u64 {
+            doc_ids.push(builder.docs.append(row_id, 1));
+        }
+
+        for doc_id in doc_ids.iter().take(4) {
+            builder.posting_lists[0].add(*doc_id, PositionRecorder::Count(1));
+        }
+        for doc_id in doc_ids.iter().skip(4).take(4) {
+            builder.posting_lists[1].add(*doc_id, PositionRecorder::Count(1));
+        }
+        for doc_id in doc_ids.iter().skip(8).take(4) {
+            builder.posting_lists[2].add(*doc_id, PositionRecorder::Count(1));
+        }
+
+        builder.write(store.as_ref()).await.unwrap();
+
+        let postings_reader = store.open_index_file(&posting_file_path(0)).await?;
+        let read_ranges = Arc::new(AtomicUsize::new(0));
+        let counting_reader = Arc::new(CountingIndexReader::new(
+            postings_reader,
+            read_ranges.clone(),
+        ));
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let list_reader = PostingListReader::try_new(counting_reader, &cache).await?;
+
+        assert_eq!(list_reader.segments.len(), 2);
+        assert_eq!(list_reader.segment_token_offsets, vec![2, 3]);
+
+        let baseline = read_ranges.load(Ordering::SeqCst);
+        list_reader
+            .posting_list(0, false, &NoOpMetricsCollector)
+            .await?;
+        list_reader
+            .posting_list(1, false, &NoOpMetricsCollector)
+            .await?;
+        let after_two = read_ranges.load(Ordering::SeqCst);
+        assert_eq!(after_two - baseline, 1);
+
+        list_reader
+            .posting_list(2, false, &NoOpMetricsCollector)
+            .await?;
+        let after_three = read_ranges.load(Ordering::SeqCst);
+        assert_eq!(after_three - baseline, 2);
+
+        Ok(())
     }
 
     #[test]
