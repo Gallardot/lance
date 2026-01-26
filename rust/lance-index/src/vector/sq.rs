@@ -111,19 +111,13 @@ impl ScalarQuantizer {
 
         let lower_index = clip_count;
         let upper_index = data.len() - 1 - clip_count;
-        let mut indices: Vec<usize> = (0..data.len()).collect();
-        let (_, lower, _) = indices.select_nth_unstable_by(lower_index, |&a, &b| {
-            let a_val: f64 = data[a].as_();
-            let b_val: f64 = data[b].as_();
-            a_val.total_cmp(&b_val)
-        });
-        let lower: f64 = data[*lower].as_();
-        let (_, upper, _) = indices.select_nth_unstable_by(upper_index, |&a, &b| {
-            let a_val: f64 = data[a].as_();
-            let b_val: f64 = data[b].as_();
-            a_val.total_cmp(&b_val)
-        });
-        let upper: f64 = data[*upper].as_();
+        let mut values: Vec<f64> = data.iter().map(|v| v.as_()).collect();
+        let (_, lower, _) =
+            values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
+        let lower = *lower;
+        let (_, upper, _) =
+            values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
+        let upper = *upper;
 
         self.metadata.bounds = lower..upper;
         Ok(self.metadata.bounds.clone())
