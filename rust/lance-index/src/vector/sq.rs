@@ -88,6 +88,47 @@ impl ScalarQuantizer {
         Ok(self.metadata.bounds.clone())
     }
 
+    fn update_bounds_with_clip<T: ArrowFloatType>(
+        &mut self,
+        vectors: &FixedSizeListArray,
+        clip: f64,
+    ) -> Result<Range<f64>> {
+        let data = vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Expect to be a float vector array, got: {:?}",
+                    vectors.value_type()
+                ),
+                location: location!(),
+            })?
+            .as_slice();
+
+        if data.is_empty() {
+            return Err(Error::invalid_input(
+                "SQ builder: empty training data".to_string(),
+                location!(),
+            ));
+        }
+
+        let mut values: Vec<f64> = data.iter().map(|v| v.as_()).collect();
+        let clip_count = ((values.len() as f64) * (clip / 100.0)).floor() as usize;
+        let lower_index = clip_count;
+        let upper_index = values.len() - 1 - clip_count;
+
+        let (_, lower, _) =
+            values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
+        let lower = *lower;
+        let (_, upper, _) =
+            values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
+        let upper = *upper;
+
+        self.metadata.bounds = lower..upper;
+        Ok(self.metadata.bounds.clone())
+    }
+
     pub fn transform<T: ArrowFloatType>(&self, data: &dyn Array) -> Result<ArrayRef> {
         let fsl = data
             .as_fixed_size_list_opt()
@@ -159,16 +200,38 @@ impl Quantization for ScalarQuantizer {
         })?;
 
         let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
+        if !(0.0..50.0).contains(&params.clip) {
+            return Err(Error::invalid_input(
+                format!(
+                    "SQ builder: clip must be in [0, 50), got {}",
+                    params.clip
+                ),
+                location!(),
+            ));
+        }
+        let use_clip = params.clip > 0.0;
 
         match fsl.value_type() {
             DataType::Float16 => {
-                quantizer.update_bounds::<Float16Type>(fsl)?;
+                if use_clip {
+                    quantizer.update_bounds_with_clip::<Float16Type>(fsl, params.clip)?;
+                } else {
+                    quantizer.update_bounds::<Float16Type>(fsl)?;
+                }
             }
             DataType::Float32 => {
-                quantizer.update_bounds::<Float32Type>(fsl)?;
+                if use_clip {
+                    quantizer.update_bounds_with_clip::<Float32Type>(fsl, params.clip)?;
+                } else {
+                    quantizer.update_bounds::<Float32Type>(fsl)?;
+                }
             }
             DataType::Float64 => {
-                quantizer.update_bounds::<Float64Type>(fsl)?;
+                if use_clip {
+                    quantizer.update_bounds_with_clip::<Float64Type>(fsl, params.clip)?;
+                } else {
+                    quantizer.update_bounds::<Float64Type>(fsl)?;
+                }
             }
             _ => {
                 return Err(Error::Index {
@@ -366,6 +429,23 @@ mod tests {
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
             assert_eq!(*v, (i * 17) as u8,);
         });
+    }
+
+    #[tokio::test]
+    async fn test_sq_build_with_clip() {
+        let float_values = Vec::from_iter((0..1000).map(|v| v as f64));
+        let float_array = Float64Array::from_iter_values(float_values.clone());
+        let vectors = FixedSizeListArray::try_new_from_values(float_array, 1).unwrap();
+        let params = SQBuildParams {
+            clip: 0.5,
+            ..Default::default()
+        };
+
+        let sq = <ScalarQuantizer as Quantization>::build(&vectors, DistanceType::L2, &params)
+            .unwrap();
+
+        assert_eq!(sq.bounds().start, 5.0);
+        assert_eq!(sq.bounds().end, 994.0);
     }
 
     #[tokio::test]

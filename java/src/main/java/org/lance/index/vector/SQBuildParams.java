@@ -19,15 +19,18 @@ import com.google.common.base.MoreObjects;
 public class SQBuildParams {
   private final short numBits;
   private final int sampleRate;
+  private final double clip;
 
   private SQBuildParams(Builder builder) {
     this.numBits = builder.numBits;
     this.sampleRate = builder.sampleRate;
+    this.clip = builder.clip;
   }
 
   public static class Builder {
     private short numBits = 8;
     private int sampleRate = 256;
+    private double clip = 0.5;
 
     public Builder() {}
 
@@ -49,6 +52,15 @@ public class SQBuildParams {
       return this;
     }
 
+    /**
+     * @param clip percentage to clip from each tail when computing bounds
+     * @return Builder
+     */
+    public Builder setClip(double clip) {
+      this.clip = clip;
+      return this;
+    }
+
     public SQBuildParams build() {
       return new SQBuildParams(this);
     }
@@ -63,11 +75,16 @@ public class SQBuildParams {
     return sampleRate;
   }
 
+  public double getClip() {
+    return clip;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("numBits", numBits)
         .add("sampleRate", sampleRate)
+        .add("clip", clip)
         .toString();
   }
 }

@@ -10,6 +10,9 @@ pub struct SQBuildParams {
 
     /// Sample rate for training.
     pub sample_rate: usize,
+
+    /// Percentage (0-50) to clip from each tail when computing bounds.
+    pub clip: f64,
 }
 
 impl Default for SQBuildParams {
@@ -17,6 +20,7 @@ impl Default for SQBuildParams {
         Self {
             num_bits: 8,
             sample_rate: 256,
+            clip: 0.5,
         }
     }
 }

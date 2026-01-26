@@ -387,10 +387,12 @@ pub fn get_vector_index_params(
                 |env, sq_obj| {
                     let num_bits = env.call_method(&sq_obj, "getNumBits", "()S", &[])?.s()? as u16;
                     let sample_rate = env.get_int_as_usize_from_method(&sq_obj, "getSampleRate")?;
+                    let clip = env.call_method(&sq_obj, "getClip", "()D", &[])?.d()?;
 
                     Ok(SQBuildParams {
                         num_bits,
                         sample_rate,
+                        clip,
                     })
                 },
             )?;

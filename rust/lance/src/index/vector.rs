@@ -1624,7 +1624,7 @@ fn derive_pq_params(pq_quantizer: &ProductQuantizer) -> PQBuildParams {
 fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
     SQBuildParams {
         num_bits: sq_quantizer.num_bits(),
-        sample_rate: 256, // Default
+        ..Default::default()
     }
 }
 
