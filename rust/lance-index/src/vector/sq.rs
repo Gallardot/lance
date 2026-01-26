@@ -67,13 +67,6 @@ impl ScalarQuantizer {
     pub fn update_bounds<T: ArrowFloatType>(
         &mut self,
         vectors: &FixedSizeListArray,
-    ) -> Result<Range<f64>> {
-        self.update_bounds_with_clip::<T>(vectors, 0.0)
-    }
-
-    fn update_bounds_with_clip<T: ArrowFloatType>(
-        &mut self,
-        vectors: &FixedSizeListArray,
         clip: f64,
     ) -> Result<Range<f64>> {
         let data = vectors
@@ -203,29 +196,15 @@ impl Quantization for ScalarQuantizer {
                 location!(),
             ));
         }
-        let use_clip = params.clip > 0.0;
-
         match fsl.value_type() {
             DataType::Float16 => {
-                if use_clip {
-                    quantizer.update_bounds_with_clip::<Float16Type>(fsl, params.clip)?;
-                } else {
-                    quantizer.update_bounds::<Float16Type>(fsl)?;
-                }
+                quantizer.update_bounds::<Float16Type>(fsl, params.clip)?;
             }
             DataType::Float32 => {
-                if use_clip {
-                    quantizer.update_bounds_with_clip::<Float32Type>(fsl, params.clip)?;
-                } else {
-                    quantizer.update_bounds::<Float32Type>(fsl)?;
-                }
+                quantizer.update_bounds::<Float32Type>(fsl, params.clip)?;
             }
             DataType::Float64 => {
-                if use_clip {
-                    quantizer.update_bounds_with_clip::<Float64Type>(fsl, params.clip)?;
-                } else {
-                    quantizer.update_bounds::<Float64Type>(fsl)?;
-                }
+                quantizer.update_bounds::<Float64Type>(fsl, params.clip)?;
             }
             _ => {
                 return Err(Error::Index {
@@ -249,13 +228,13 @@ impl Quantization for ScalarQuantizer {
 
         match fsl.value_type() {
             DataType::Float16 => {
-                self.update_bounds::<Float16Type>(fsl)?;
+                self.update_bounds::<Float16Type>(fsl, 0.0)?;
             }
             DataType::Float32 => {
-                self.update_bounds::<Float32Type>(fsl)?;
+                self.update_bounds::<Float32Type>(fsl, 0.0)?;
             }
             DataType::Float64 => {
-                self.update_bounds::<Float64Type>(fsl)?;
+                self.update_bounds::<Float64Type>(fsl, 0.0)?;
             }
             value_type => {
                 return Err(Error::invalid_input(
@@ -350,7 +329,7 @@ mod tests {
                 .unwrap();
         let mut sq = ScalarQuantizer::new(8, float_values.len());
 
-        sq.update_bounds::<Float16Type>(&vectors).unwrap();
+        sq.update_bounds::<Float16Type>(&vectors, 0.0).unwrap();
         assert_eq!(sq.bounds().start, float_values[0].to_f64());
         assert_eq!(
             sq.bounds().end,
@@ -379,7 +358,7 @@ mod tests {
                 .unwrap();
         let mut sq = ScalarQuantizer::new(8, float_values.len());
 
-        sq.update_bounds::<Float32Type>(&vectors).unwrap();
+        sq.update_bounds::<Float32Type>(&vectors, 0.0).unwrap();
         assert_eq!(sq.bounds().start, float_values[0].to_f64().unwrap());
         assert_eq!(
             sq.bounds().end,
@@ -408,7 +387,7 @@ mod tests {
                 .unwrap();
         let mut sq = ScalarQuantizer::new(8, float_values.len());
 
-        sq.update_bounds::<Float64Type>(&vectors).unwrap();
+        sq.update_bounds::<Float64Type>(&vectors, 0.0).unwrap();
         assert_eq!(sq.bounds().start, float_values[0]);
         assert_eq!(sq.bounds().end, float_values.last().cloned().unwrap());
 
