@@ -143,11 +143,9 @@ impl ScalarQuantizer {
                     }),
             );
 
-            let (_, lower, _) =
-                values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
+            let (_, lower, _) = values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
             let lower = *lower;
-            let (_, upper, _) =
-                values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
+            let (_, upper, _) = values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
             let upper = *upper;
 
             global_lower = Some(match global_lower {
