@@ -129,13 +129,19 @@ impl ScalarQuantizer {
         let mut global_lower: Option<f64> = None;
         let mut global_upper: Option<f64> = None;
 
+        let mut values: Vec<f64> = Vec::with_capacity(num_rows);
         for dim_index in 0..dim {
-            let mut values: Vec<f64> = Vec::with_capacity(num_rows);
-            let mut offset = dim_index;
-            for _ in 0..num_rows {
-                values.push(data[offset].as_());
-                offset += dim;
-            }
+            values.clear();
+            values.extend(
+                data.iter()
+                    .skip(dim_index)
+                    .step_by(dim)
+                    .take(num_rows)
+                    .map(|v| {
+                        let value: f64 = v.as_();
+                        value
+                    }),
+            );
 
             let (_, lower, _) =
                 values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
