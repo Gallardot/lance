@@ -25,7 +25,7 @@ use super::quantizer::Quantization;
 use super::residual::ResidualTransform;
 use super::sq::transform::SQTransformer;
 use super::sq::ScalarQuantizer;
-use super::transform::KeepFiniteVectors;
+use super::transform::{random_rotation_matrix, KeepFiniteVectors, RandomRotationTransformer};
 use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
@@ -204,6 +204,17 @@ impl IvfTransformer {
             distance_type
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
+
+        if let Some(seed) = pq.rotation_seed {
+            let rotate_mat = pq.rotation_matrix.clone().unwrap_or_else(|| {
+                random_rotation_matrix(pq.dimension as i32, &pq.codebook.value_type(), seed)
+                    .expect("failed to build random rotation matrix for IVF_PQ")
+            });
+            transforms.push(Arc::new(RandomRotationTransformer::new(
+                vector_column,
+                rotate_mat,
+            )));
+        }
 
         let partition_transform = Arc::new(PartitionTransformer::new(
             centroids.clone(),

@@ -64,6 +64,8 @@ pub struct ProductQuantizationMetadata {
     // deprecated in later version
     pub codebook_tensor: Vec<u8>,
     pub transposed: bool,
+    #[serde(default)]
+    pub rotation_seed: Option<u64>,
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
@@ -81,6 +83,7 @@ impl PartialEq for ProductQuantizationMetadata {
             && self.nbits == other.nbits
             && self.dimension == other.dimension
             && self.codebook == other.codebook
+            && self.rotation_seed == other.rotation_seed
     }
 }
 
@@ -188,6 +191,7 @@ impl ProductQuantizationStorage {
         dimension: usize,
         distance_type: DistanceType,
         transposed: bool,
+        rotation_seed: Option<u64>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         if batch.num_columns() != 2 {
@@ -295,6 +299,7 @@ impl ProductQuantizationStorage {
             codebook: Some(codebook),
             codebook_tensor: Vec::new(), // empty for v1 format
             transposed: true,
+            rotation_seed,
         };
         Ok(Self {
             metadata,
@@ -330,6 +335,7 @@ impl ProductQuantizationStorage {
         let dimension = quantizer.dimension;
         let num_sub_vectors = quantizer.num_sub_vectors;
         let metric_type = quantizer.distance_type;
+        let rotation_seed = quantizer.rotation_seed;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch)?;
         Self::new(
@@ -340,6 +346,7 @@ impl ProductQuantizationStorage {
             dimension,
             metric_type,
             false,
+            rotation_seed,
             frag_reuse_index,
         )
     }
@@ -486,6 +493,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
+            metadata.rotation_seed,
             frag_reuse_index,
         )
     }
@@ -592,6 +600,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
+            metadata.rotation_seed,
             frag_reuse_index,
         )
     }

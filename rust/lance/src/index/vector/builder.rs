@@ -35,13 +35,14 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::vector::bq::storage::{unpack_codes, RABIT_CODE_COLUMN};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{
-    QuantizationMetadata, QuantizationType, QuantizerBuildParams,
+    QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{write_unified_ivf_and_index_metadata, SupportedIvfIndexType};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
-use lance_index::vector::transform::Flatten;
+use lance_index::vector::transform::{random_rotation_matrix, rotate_fsl, Flatten};
 use lance_index::vector::utils::is_finite;
 use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
@@ -74,6 +75,7 @@ use lance_linalg::kernels::normalize_fsl;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
+use rand::Rng;
 use snafu::location;
 use tracing::{instrument, span, Level};
 
@@ -150,6 +152,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     merged_num: usize,
     // whether to transpose codes when building storage
     transpose_codes: bool,
+    // deterministic random rotation used by IVF_PQ only
+    pq_rotation_seed: Option<u64>,
+    pq_rotation_matrix: Option<FixedSizeListArray>,
 }
 
 type BuildStream<S, Q> =
@@ -192,6 +197,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            pq_rotation_seed: None,
+            pq_rotation_matrix: None,
         })
     }
 
@@ -259,6 +266,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            pq_rotation_seed: None,
+            pq_rotation_matrix: None,
         })
     }
 
@@ -266,9 +275,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // return the number of indices merged
     pub async fn build(&mut self) -> Result<usize> {
         // step 1. train IVF & quantizer
-        self.with_ivf(self.load_or_build_ivf().await?);
+        let ivf = self.load_or_build_ivf().await?;
+        self.with_ivf(ivf);
 
-        self.with_quantizer(self.load_or_build_quantizer().await?);
+        let quantizer = self.load_or_build_quantizer().await?;
+        self.with_quantizer(quantizer);
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
@@ -343,6 +354,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     pub fn with_quantizer(&mut self, quantizer: Q) -> &mut Self {
+        if Self::use_random_rotation() {
+            if let Quantizer::Product(pq) = quantizer.clone().into() {
+                self.pq_rotation_seed = pq.rotation_seed;
+                self.pq_rotation_matrix = pq.rotation_matrix.clone();
+            }
+        }
         self.quantizer = Some(quantizer);
         self
     }
@@ -365,35 +382,85 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
+    fn use_random_rotation() -> bool {
+        Q::quantization_type() == QuantizationType::Product && S::name() == "FLAT"
+    }
+
+    fn ensure_pq_rotation_matrix(
+        &mut self,
+        dim: usize,
+        value_type: &DataType,
+    ) -> Result<Option<FixedSizeListArray>> {
+        if !Self::use_random_rotation() {
+            return Ok(None);
+        }
+
+        if self.pq_rotation_seed.is_none() {
+            if self.quantizer.is_some() {
+                return Ok(None);
+            }
+            self.pq_rotation_seed = Some(rand::rng().random::<u64>());
+        }
+
+        if self.pq_rotation_matrix.is_none() {
+            let seed = self
+                .pq_rotation_seed
+                .expect("rotation seed must be set before matrix generation");
+            self.pq_rotation_matrix = Some(random_rotation_matrix(dim as i32, value_type, seed)?);
+        }
+
+        Ok(self.pq_rotation_matrix.clone())
+    }
+
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]
-    async fn load_or_build_ivf(&self) -> Result<IvfModel> {
+    async fn load_or_build_ivf(&mut self) -> Result<IvfModel> {
         match &self.ivf {
             Some(ivf) => Ok(ivf.clone()),
             None => {
-                let Some(dataset) = self.dataset.as_ref() else {
+                let Some(dataset) = self.dataset.clone() else {
                     return Err(Error::invalid_input(
                         "dataset not set before loading or building IVF",
                         location!(),
                     ));
                 };
                 let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
-                let ivf_params = self.ivf_params.as_ref().ok_or(Error::invalid_input(
+                let ivf_params = self.ivf_params.clone().ok_or(Error::invalid_input(
                     "IVF build params not set",
                     location!(),
                 ))?;
-                super::build_ivf_model(dataset, &self.column, dim, self.distance_type, ivf_params)
-                    .await
+                let value_type = infer_vector_element_type(
+                    &dataset
+                        .schema()
+                        .field(&self.column)
+                        .ok_or_else(|| {
+                            Error::invalid_input(
+                                format!("vector column {} does not exist", self.column),
+                                location!(),
+                            )
+                        })?
+                        .data_type(),
+                )?;
+                let rotation_matrix = self.ensure_pq_rotation_matrix(dim, &value_type)?;
+                super::build_ivf_model(
+                    &dataset,
+                    &self.column,
+                    dim,
+                    self.distance_type,
+                    &ivf_params,
+                    rotation_matrix.as_ref(),
+                )
+                .await
             }
         }
     }
 
     #[instrument(name = "load_or_build_quantizer", level = "debug", skip_all)]
-    async fn load_or_build_quantizer(&self) -> Result<Q> {
+    async fn load_or_build_quantizer(&mut self) -> Result<Q> {
         if self.quantizer.is_some() {
             return Ok(self.quantizer.clone().unwrap());
         }
 
-        let Some(dataset) = self.dataset.as_ref() else {
+        let Some(dataset) = self.dataset.clone() else {
             return Err(Error::invalid_input(
                 "dataset not set before loading or building quantizer",
                 location!(),
@@ -410,7 +477,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             sample_size_hint
         );
         let training_data =
-            utils::maybe_sample_training_data(dataset, &self.column, sample_size_hint).await?;
+            utils::maybe_sample_training_data(&dataset, &self.column, sample_size_hint).await?;
         info!(
             "Finished loading training data in {:02} seconds",
             start.elapsed().as_secs_f32()
@@ -427,6 +494,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
         let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
         let training_data = training_data.as_fixed_size_list();
+        let training_data = if let Some(rotation_mat) = self.ensure_pq_rotation_matrix(
+            training_data.value_length() as usize,
+            &training_data.value_type(),
+        )? {
+            rotate_fsl(training_data, &rotation_mat)?
+        } else {
+            training_data.clone()
+        };
 
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
@@ -436,7 +511,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     vec![],
                 );
                 span!(Level::INFO, "compute residual for PQ training")
-                    .in_scope(|| ivf_transformer.compute_residual(training_data))?
+                    .in_scope(|| ivf_transformer.compute_residual(&training_data))?
             }
             _ => training_data.clone(),
         };
@@ -451,6 +526,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 )?;
                 Q::build(&training_data, DistanceType::L2, quantizer_params)?
             }
+        };
+        let quantizer = if Self::use_random_rotation() {
+            let quantizer_enum: Quantizer = quantizer.clone().into();
+            let mut pq: ProductQuantizer = quantizer_enum.try_into()?;
+            pq.rotation_seed = self.pq_rotation_seed;
+            pq.rotation_matrix = self.pq_rotation_matrix.clone();
+            Quantizer::Product(pq).try_into()?
+        } else {
+            quantizer
         };
         info!(
             "Trained quantizer in {:02} seconds",

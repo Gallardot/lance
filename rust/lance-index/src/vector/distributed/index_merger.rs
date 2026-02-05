@@ -1550,6 +1550,7 @@ mod tests {
             codebook: Some(codebook.clone()),
             codebook_tensor: Vec::new(),
             transposed: true,
+            rotation_seed: None,
         };
 
         let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;

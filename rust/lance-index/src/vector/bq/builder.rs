@@ -13,6 +13,7 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use lance_core::{Error, Result};
 use ndarray::{s, Axis};
 use num_traits::{AsPrimitive, FromPrimitive};
+use rand::SeedableRng;
 use rand_distr::Distribution;
 use snafu::location;
 
@@ -306,10 +307,9 @@ impl From<RabitQuantizer> for Quantizer {
     }
 }
 
-fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
-    let mut rng = rand::rng();
+fn random_normal_matrix<R: rand::Rng + ?Sized>(n: usize, rng: &mut R) -> ndarray::Array2<f64> {
     let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
-    ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
+    ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(rng))
 }
 
 // implement the householder qr decomposition referenced from https://en.wikipedia.org/wiki/Householder_transformation#QR_decomposition
@@ -355,11 +355,27 @@ fn householder_qr(a: ndarray::Array2<f64>) -> (ndarray::Array2<f64>, ndarray::Ar
     (q, r)
 }
 
-fn random_orthogonal<T: ArrowFloatType>(n: usize) -> ndarray::Array2<T::Native>
+pub(crate) fn random_orthogonal<T: ArrowFloatType>(n: usize) -> ndarray::Array2<T::Native>
 where
     T::Native: FromPrimitive,
 {
-    let a = random_normal_matrix(n);
+    let mut rng = rand::rng();
+    let a = random_normal_matrix(n, &mut rng);
+    let (q, _) = householder_qr(a);
+
+    // cast f64 matrix to T::Native matrix
+    q.mapv(|v| T::Native::from_f64(v).unwrap())
+}
+
+pub(crate) fn random_orthogonal_with_seed<T: ArrowFloatType>(
+    n: usize,
+    seed: u64,
+) -> ndarray::Array2<T::Native>
+where
+    T::Native: FromPrimitive,
+{
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let a = random_normal_matrix(n, &mut rng);
     let (q, _) = householder_qr(a);
 
     // cast f64 matrix to T::Native matrix
@@ -377,7 +393,8 @@ mod tests {
     #[case(16)]
     #[case(32)]
     fn test_householder_qr(#[case] n: usize) {
-        let a = random_normal_matrix(n);
+        let mut rng = rand::rng();
+        let a = random_normal_matrix(n, &mut rng);
         let (m, n) = a.dim();
 
         let (q, r) = householder_qr(a.clone());

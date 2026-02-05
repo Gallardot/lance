@@ -33,6 +33,7 @@ pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
 };
+use super::transform::random_rotation_matrix;
 use super::{pb, PQ_CODE_COLUMN};
 use crate::vector::kmeans::compute_partition;
 pub use builder::PQBuildParams;
@@ -45,6 +46,8 @@ pub struct ProductQuantizer {
     pub dimension: usize,
     pub codebook: FixedSizeListArray,
     pub distance_type: DistanceType,
+    pub rotation_seed: Option<u64>,
+    pub rotation_matrix: Option<FixedSizeListArray>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
@@ -54,6 +57,12 @@ impl DeepSizeOf for ProductQuantizer {
             + self.num_bits.deep_size_of_children(_context)
             + self.dimension.deep_size_of_children(_context)
             + self.distance_type.deep_size_of_children(_context)
+            + self.rotation_seed.deep_size_of_children(_context)
+            + self
+                .rotation_matrix
+                .as_ref()
+                .map(|matrix| matrix.get_array_memory_size())
+                .unwrap_or(0)
     }
 }
 
@@ -71,6 +80,8 @@ impl ProductQuantizer {
             dimension,
             codebook,
             distance_type,
+            rotation_seed: None,
+            rotation_matrix: None,
         }
     }
 
@@ -92,7 +103,26 @@ impl ProductQuantizer {
             dimension: proto.dimension as usize,
             codebook,
             distance_type,
+            rotation_seed: None,
+            rotation_matrix: None,
         })
+    }
+
+    pub fn with_rotation(mut self, seed: Option<u64>, matrix: Option<FixedSizeListArray>) -> Self {
+        self.rotation_seed = seed;
+        self.rotation_matrix = matrix;
+        self
+    }
+
+    pub fn rotation_matrix(&self) -> Result<Option<FixedSizeListArray>> {
+        if let Some(matrix) = &self.rotation_matrix {
+            return Ok(Some(matrix.clone()));
+        }
+        self.rotation_seed
+            .map(|seed| {
+                random_rotation_matrix(self.dimension as i32, &self.codebook.value_type(), seed)
+            })
+            .transpose()
     }
 
     #[instrument(name = "ProductQuantizer::transform", level = "debug", skip_all)]
@@ -405,6 +435,8 @@ impl Quantization for ProductQuantizer {
 
     fn retrain(&mut self, data: &dyn Array) -> Result<()> {
         assert_eq!(data.null_count(), 0);
+        let rotation_seed = self.rotation_seed;
+        let rotation_matrix = self.rotation_matrix.clone();
         let params = PQBuildParams::with_codebook(
             self.num_sub_vectors,
             self.num_bits as usize,
@@ -412,6 +444,8 @@ impl Quantization for ProductQuantizer {
         );
 
         *self = params.build(data, self.distance_type)?;
+        self.rotation_seed = rotation_seed;
+        self.rotation_matrix = rotation_matrix;
         Ok(())
     }
 
@@ -470,6 +504,7 @@ impl Quantization for ProductQuantizer {
             codebook: Some(self.codebook.clone()),
             codebook_tensor: Vec::new(),
             transposed: args.map(|args| args.transposed).unwrap_or_default(),
+            rotation_seed: self.rotation_seed,
         }
     }
 
@@ -485,13 +520,16 @@ impl Quantization for ProductQuantizer {
                 FixedSizeListArray::try_from(&tensor)?
             }
         };
-        Ok(Quantizer::Product(Self::new(
-            metadata.num_sub_vectors,
-            metadata.nbits,
-            metadata.dimension,
-            codebook,
-            distance_type,
-        )))
+        Ok(Quantizer::Product(
+            Self::new(
+                metadata.num_sub_vectors,
+                metadata.nbits,
+                metadata.dimension,
+                codebook,
+                distance_type,
+            )
+            .with_rotation(metadata.rotation_seed, None),
+        ))
     }
 
     fn field(&self) -> Field {

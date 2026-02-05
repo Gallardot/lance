@@ -13,7 +13,7 @@ use crate::index::{
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -35,6 +35,7 @@ use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
+use lance_index::vector::transform::rotate_query_vector;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::{
@@ -116,6 +117,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     distance_type: DistanceType,
 
+    rotation_matrix: Option<FixedSizeListArray>,
+
     index_cache: WeakLanceCache,
 
     _marker: PhantomData<(S, Q)>,
@@ -128,6 +131,11 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
             + self.storage.deep_size_of_children(context)
+            + self
+                .rotation_matrix
+                .as_ref()
+                .map(|matrix| matrix.get_array_memory_size())
+                .unwrap_or(0)
         // Skipping session since it is a weak ref
     }
 }
@@ -212,6 +220,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         .await?;
         let storage =
             IvfQuantizationStorage::try_new(storage_reader, frag_reuse_index.clone()).await?;
+        let rotation_matrix = match storage.quantizer()? {
+            Quantizer::Product(pq) => pq.rotation_matrix()?,
+            _ => None,
+        };
 
         let num_partitions = ivf.num_partitions();
         Ok(Self {
@@ -223,6 +235,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
+            rotation_matrix,
             index_cache: WeakLanceCache::from(&index_cache),
             _marker: PhantomData,
         })
@@ -309,11 +322,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         self.storage.load_partition(partition_id).await
     }
 
+    fn rotate_query_key_if_needed(&self, key: &ArrayRef) -> Result<ArrayRef> {
+        match &self.rotation_matrix {
+            Some(rotation_matrix) => rotate_query_vector(key.as_ref(), rotation_matrix),
+            None => Ok(key.clone()),
+        }
+    }
+
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
     #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
+        let mut part_query = query.clone();
+        part_query.key = self.rotate_query_key_if_needed(&query.key)?;
+
         if Q::use_residual(self.distance_type) {
             let partition_centroids =
                 self.ivf
@@ -322,12 +345,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                         message: format!("partition centroid {} does not exist", partition_id),
                         location: location!(),
                     })?;
-            let residual_key = sub(&query.key, &partition_centroids)?;
-            let mut part_query = query.clone();
+            let residual_key = sub(&part_query.key, &partition_centroids)?;
             part_query.key = residual_key;
             Ok(part_query)
         } else {
-            Ok(query.clone())
+            Ok(part_query)
         }
     }
 }
@@ -460,8 +482,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         };
 
         let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
-
-        self.ivf.find_partitions(&query.key, max_nprobes, dt)
+        let key = self.rotate_query_key_if_needed(&query.key)?;
+        self.ivf.find_partitions(key.as_ref(), max_nprobes, dt)
     }
 
     fn total_partitions(&self) -> usize {

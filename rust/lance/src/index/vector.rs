@@ -2143,7 +2143,7 @@ mod tests {
             ..Default::default()
         };
         let dim = utils::get_vector_dim(dataset.schema(), "vector").unwrap();
-        let ivf_model = build_ivf_model(&dataset, "vector", dim, MetricType::L2, &ivf_params)
+        let ivf_model = build_ivf_model(&dataset, "vector", dim, MetricType::L2, &ivf_params, None)
             .await
             .unwrap();
 
@@ -2187,7 +2187,7 @@ mod tests {
             ..Default::default()
         };
         let dim = utils::get_vector_dim(dataset.schema(), "vector").unwrap();
-        let ivf_model = build_ivf_model(&dataset, "vector", dim, MetricType::L2, &ivf_params)
+        let ivf_model = build_ivf_model(&dataset, "vector", dim, MetricType::L2, &ivf_params, None)
             .await
             .unwrap();
 
