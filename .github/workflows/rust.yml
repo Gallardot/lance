@@ -86,6 +86,8 @@ jobs:
       # Need up-to-date compilers for kernels
       CC: clang
       CXX: clang++
+      # Pin nightly to avoid regressions in transitive deps on latest nightly.
+      NIGHTLY_TOOLCHAIN: nightly-2026-02-20
       # Treat warnings as errors to catch issues early
       RUSTFLAGS: "-D warnings"
     steps:
@@ -93,8 +95,8 @@ jobs:
       # pin the toolchain version to avoid surprises
       - name: Setup rust toolchain
         run: |
-          rustup toolchain install nightly
-          rustup default nightly
+          rustup toolchain install ${{ env.NIGHTLY_TOOLCHAIN }}
+          rustup default ${{ env.NIGHTLY_TOOLCHAIN }}
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
@@ -108,7 +110,7 @@ jobs:
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo +nightly llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo +${{ env.NIGHTLY_TOOLCHAIN }} llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
