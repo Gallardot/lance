@@ -704,7 +704,6 @@ impl CoreFieldDecoderStrategy {
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
-                self.cache_repetition_index,
                 field,
             )?);
 
@@ -721,7 +720,6 @@ impl CoreFieldDecoderStrategy {
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
-                        self.cache_repetition_index,
                         field,
                     )?);
 
@@ -745,7 +743,6 @@ impl CoreFieldDecoderStrategy {
                         let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                             column_info.as_ref(),
                             self.decompressor_strategy.as_ref(),
-                            self.cache_repetition_index,
                             field,
                         )?);
                         column_infos.next_top_level();
