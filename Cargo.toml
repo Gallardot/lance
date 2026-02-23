@@ -145,6 +145,7 @@ geo-traits = "0.3.0"
 geo-types = "0.7.16"
 http = "1.1.0"
 humantime = "2.2.0"
+home = "0.5.12"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 jieba-rs = { version = "0.8.1", default-features = false }
@@ -177,7 +178,6 @@ rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
-shellexpand = "3.0"
 slatedb = "0.3"
 snafu = "0.8"
 strum = "0.26"

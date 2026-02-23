@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use home::home_dir;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
@@ -26,7 +27,6 @@ use object_store::Error as ObjectStoreError;
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
-use shellexpand::tilde;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
 use url::Url;
@@ -337,7 +337,7 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
 }
 
 fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
-    let expanded = tilde(str_path.as_ref()).to_string();
+    let expanded = expand_tilde(str_path.as_ref());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
         .unwrap()
@@ -351,6 +351,25 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     }
 
     Ok(expanded_path)
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(stripped) = path.strip_prefix('~') {
+        if stripped.is_empty() || stripped.starts_with('/') || stripped.starts_with('\\') {
+            if let Some(home) = home_dir() {
+                let mut expanded = home;
+                if !stripped.is_empty() {
+                    let suffix = stripped.trim_start_matches(&['/', '\\'][..]);
+                    if !suffix.is_empty() {
+                        expanded.push(suffix);
+                    }
+                }
+                return expanded.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    path.to_string()
 }
 
 fn local_path_to_url(str_path: &str) -> Result<Url> {
@@ -967,7 +986,7 @@ mod tests {
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
-        let expanded = tilde(path_str).to_string();
+        let expanded = expand_tilde(path_str);
         let path = StdPath::new(&expanded);
         std::fs::create_dir_all(path.parent().unwrap())?;
         write(path, contents)
