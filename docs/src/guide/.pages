@@ -9,5 +9,6 @@ nav:
   - Distributed Write: distributed_write.md
   - Migration Guide: migration.md
   - Performance Guide: performance.md
+  - Environment Variables: environment_variables.md
   - Tokenizer: tokenizer.md
   - Extension Arrays: arrays.md
