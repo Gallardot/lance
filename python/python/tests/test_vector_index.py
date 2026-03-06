@@ -1047,7 +1047,9 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
 
 
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
-    ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed_skip_transpose.lance")
+    ds = lance.write_dataset(
+        dataset.to_table(), tmp_path / "indexed_skip_transpose.lance"
+    )
     ds = ds.create_index(
         "vector",
         index_type="IVF_PQ",
