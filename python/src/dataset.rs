@@ -3201,6 +3201,7 @@ fn prepare_vector_index_params(
     let mut sq_params = SQBuildParams::default();
     let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
+    let mut skip_transpose = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -3330,6 +3331,10 @@ fn prepare_vector_index_params(
             index_file_version = IndexFileVersion::try_from(&version)
                 .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
         }
+
+        if let Some(value) = kwargs.get_item("skip_transpose")? {
+            skip_transpose = value.extract()?;
+        }
     }
 
     let mut params = match index_type {
@@ -3374,6 +3379,7 @@ fn prepare_vector_index_params(
         ))),
     }?;
     params.version(index_file_version);
+    params.skip_transpose(skip_transpose);
     Ok(params)
 }
 
